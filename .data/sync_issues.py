@@ -14,6 +14,7 @@ from github.GithubException import (
 token = os.environ.get("GITHUB_TOKEN")
 github = Github(token)
 
+exception_filenames = [".data", ".git", ".github", "README.md", "Audit_Report.pdf", "comments.csv"]
 
 def github_retry_on_rate_limit(func):
     @wraps(func)
@@ -101,7 +102,7 @@ def process_directory(repo, path):
     repo_items = [
         x
         for x in repo.get_contents(path)
-        if x.name not in [".data", ".github", "README.md", "Audit_Report.pdf"]
+        if x.name not in exception_filenames
     ]
     for item in repo_items:
         print("Reading file %s" % item.name)
@@ -146,10 +147,10 @@ def process_directory(repo, path):
                 parent = issue_id
             else:
                 issue_id = int(file.name.replace(".md", ""))
-            
+
             if len(files) == 1:
                 parent = issue_id
-                
+
             body = file.decoded_content.decode("utf-8")
             auditor = body.split("\n")[0]
             issue_title = re.match(r"^(?:[#\s]+)(.*)$", body.split("\n")[4]).group(1)
@@ -199,7 +200,7 @@ def main():
     run_number = int(os.environ.get("GITHUB_RUN_NUMBER"))
 
     repo = RepositoryExtended.cast(github.get_repo(repo))
-    
+
     labels = [
         {
             "name": "High",

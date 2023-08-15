@@ -1,5 +1,6 @@
 import os
 
+exception_filenames = [".data", ".git", ".github", "README.md", "Audit_Report.pdf", "comments.csv"]
 
 def main():
     added_files = os.environ.get("ADDED_FILES")
@@ -13,7 +14,7 @@ def main():
             for x in added_files.split(" ")
             if not any(
                 y in x
-                for y in [".data", ".git", ".github", "README.md", "Audit_Report.pdf"]
+                for y in exception_filenames
             )
         ]
     else:
@@ -25,7 +26,7 @@ def main():
             for x in modified_files.split(" ")
             if not any(
                 y in x
-                for y in [".data", ".git", ".github", "README.md", "Audit_Report.pdf"]
+                for y in exception_filenames
             )
         ]
     else:
@@ -37,7 +38,7 @@ def main():
             for x in renamed_files.split(" ")
             if not any(
                 y in x
-                for y in [".data", ".git", ".github", "README.md", "Audit_Report.pdf"]
+                for y in exception_filenames
             )
         ]
     else:
@@ -49,7 +50,7 @@ def main():
             for x in removed_files.split(" ")
             if not any(
                 y in x
-                for y in [".data", ".git", ".github", "README.md", "Audit_Report.pdf"]
+                for y in exception_filenames
             )
         ]
     else:

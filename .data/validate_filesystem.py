@@ -1,8 +1,38 @@
 import os
 import re
+import csv
 
+total_issues = None
+comment_filename = "comments.csv"
+exception_filenames = [".data", ".git", ".github", "README.md", "Audit_Report.pdf", ".gitkeep", comment_filename]
+
+def consume_comment_file():
+    with open(comment_filename) as f:
+        try:
+            reader = csv.DictReader(f)
+        except Exception:
+            return ["Unable to consume %s" % comment_filename]
+
+        if not reader.fieldnames or reader.fieldnames != ["issue_number", "comment"]:
+            return ["Incorrect csv header, expected `issue_number,comment`"]
+
+        errors = []
+        for row in reader:
+            try:
+                issue_number = int(re.match(r"(\d+)", row["issue_number"]).group(0))
+            except Exception:
+                errors.append("Unable to extract issue number from %s" % row)
+                continue
+            if issue_number < 1 or issue_number > total_issues:
+                errors.append("Issue %s should not be in csv" % issue_number)
+
+            if len(row["comment"]) == 0:
+                errors.append("Empty comment on issue %s in the csv" % issue_number)
+        return errors
 
 def main():
+    global total_issues
+
     try:
         total_issues = int(os.environ.get("TOTAL_ISSUES"))
     except:
@@ -22,7 +52,7 @@ def main():
         items = [
             x
             for x in os.listdir(path)
-            if x not in [".data", ".git", ".github", "README.md", "Audit_Report.pdf", ".gitkeep"]
+            if x not in exception_filenames
         ]
 
         directory_has_report = False
@@ -90,6 +120,9 @@ def main():
     for x in issues:
         if x not in expected_issues:
             errors.append("Issue %s should not be in the repo." % x)
+
+    if os.path.exists(comment_filename):
+        errors.extend(consume_comment_file())
 
     if len(errors) > 0:
         for error in errors:
