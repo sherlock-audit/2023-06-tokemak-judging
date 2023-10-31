@@ -610,7 +610,351 @@ Manual Review
 
  updateDebtReporting should not have any input param, should by default update for all added destination vaults
 
-# Issue H-7: Inflated price due to unnecessary precision scaling 
+# Issue H-7: Stat calculator returns incorrect report for swETH 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/587 
+
+## Found by 
+xiaoming90
+
+Stat calculator returns incorrect reports for swETH, causing multiple implications that could lead to losses to the protocol,
+
+## Vulnerability Detail
+
+The purpose of the in-scope `SwEthEthOracle` contract is to act as a price oracle specifically for swETH (Swell ETH) per the comment in the contract below and the codebase's [README](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main/v2-core-audit-2023-07-14/src/oracles#lst-oracles)
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/SwEthEthOracle.sol#L16
+
+```solidity
+File: SwEthEthOracle.sol
+12: /**
+13:  * @notice Price oracle specifically for swEth (Swell Eth).
+14:  * @dev getPriceEth is not a view fn to support reentrancy checks. Does not actually change state.
+15:  */
+16: contract SwEthEthOracle is SystemComponent, IPriceOracle {
+```
+
+Per the codebase in the contest repository, the price oracle for the swETH is understood to be configured to the `SwEthEthOracle` contract at Line 252 below.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/test/oracles/RootOracleIntegrationTest.t.sol#L252
+
+```solidity
+File: RootOracleIntegrationTest.t.sol
+162:         swEthOracle = new SwEthEthOracle(systemRegistry, IswETH(SWETH_MAINNET));
+..SNIP..
+249:         // Lst special pricing case setup
+250:         // priceOracle.registerMapping(SFRXETH_MAINNET, IPriceOracle(address(sfrxEthOracle)));
+251:         priceOracle.registerMapping(WSTETH_MAINNET, IPriceOracle(address(wstEthOracle)));
+252:         priceOracle.registerMapping(SWETH_MAINNET, IPriceOracle(address(swEthOracle)));
+```
+
+Thus, in the context of this audit, the price oracle for the swETH is mapped to the `SwEthEthOracle` contract.
+
+Both the swETH oracle and calculator use the same built-in [`swEth.swETHToETHRate`](https://etherscan.io/address/0xdda46bf18eeb3e06e2f12975a3a184e40581a72f#code#F1#L148) function to retrieve the price of swETH in ETH.
+
+| LST   | Oracle                                    | Calculator                                                   | Rebasing |
+| ----- | ----------------------------------------- | ------------------------------------------------------------ | -------- |
+| swETH | SwEthEthOracle - `swEth.swETHToETHRate()` | SwethLSTCalculator - `IswETH(lstTokenAddress).swETHToETHRate()` | False    |
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/SwEthEthOracle.sol#L26
+
+```solidity
+File: SwEthEthOracle.sol
+25:     /// @inheritdoc IPriceOracle
+26:     function getPriceInEth(address token) external view returns (uint256 price) {
+..SNIP..
+30:         // Returns in 1e18 precision.
+31:         price = swEth.swETHToETHRate();
+32:     }
+```
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/stats/calculators/SwethLSTCalculator.sol#L12
+
+```solidity
+File: SwethLSTCalculator.sol
+12:     function calculateEthPerToken() public view override returns (uint256) {
+13:         return IswETH(lstTokenAddress).swETHToETHRate();
+14:     }
+```
+
+Within the `LSTCalculatorBase.current` function, assume that the `swEth.swETHToETHRate` function returns $x$ when called. In this case, the `price` at Line 203 below and `backing` in Line 210 below will be set to $x$ since the `getPriceInEth` and `calculateEthPerToken` functions depend on the same `swEth.swETHToETHRate` function internally. Thus, `priceToBacking` will always be 1e18:
+
+$$
+\begin{align}
+priceToBacking &= \frac{price \times 1e18}{backing} \\
+&= \frac{x \times 1e18}{x} \\
+&= 1e18
+\end{align}
+$$
+
+Since `priceToBacking` is always 1e18, the `premium` will always be zero:
+
+$$
+\begin{align}
+premium &= priceToBacking - 1e18 \\
+&= 1e18 - 1e18 \\
+&= 0
+\end{align}
+$$
+
+As a result, the calculator for swETH will always report the wrong statistic report for swETH. If there is a premium or discount, the calculator will wrongly report none.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/stats/calculators/base/LSTCalculatorBase.sol#L189
+
+
+```solidity
+File: LSTCalculatorBase.sol
+189:     function current() external returns (LSTStatsData memory) {
+..SNIP..
+202:         IRootPriceOracle pricer = systemRegistry.rootPriceOracle();
+203:         uint256 price = pricer.getPriceInEth(lstTokenAddress);
+..SNIP..
+210:             uint256 backing = calculateEthPerToken();
+211:             // price is always 1e18 and backing is in eth, which is 1e18
+212:             priceToBacking = price * 1e18 / backing;
+213:         }
+214: 
+215:         // positive value is a premium; negative value is a discount
+216:         int256 premium = int256(priceToBacking) - 1e18;
+217: 
+218:         return LSTStatsData({
+219:             lastSnapshotTimestamp: lastSnapshotTimestamp,
+220:             baseApr: baseApr,
+221:             premium: premium,
+222:             slashingCosts: slashingCosts,
+223:             slashingTimestamps: slashingTimestamps
+224:         });
+225:     }
+```
+
+## Impact
+
+The purpose of the stats/calculators contracts is to store, augment, and clean data relevant to the LMPs. When the solver proposes a rebalance, the strategy uses the stats contracts to calculate a composite return (score) for the proposed destinations. Using that composite return, it determines if the swap is beneficial for the vault.
+
+If a stat calculator provides inaccurate information, it can cause multiple implications that lead to losses to the protocol, such as false signals allowing the unprofitable rebalance to be executed.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/stats/calculators/base/LSTCalculatorBase.sol#L189
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+When handling the swETH within the `LSTCalculatorBase.current` function, consider other methods of obtaining the fair market price of swETH that do not rely on the `swEth.swETHToETHRate` function such as external 3rd-party price oracle.
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> invalid, I think it's intended to let premium = 0 in case of swETH. Also I don't see any further vulnerability if premium = 0
+
+
+
+**xiaoming9090**
+
+Escalate
+
+After my discussion with the protocol team during the audit period (as shown below), the purpose of the `premium` variable is to determine if an LST is trading at a premium/discount relative to its actual ETH backing. This is one of the signals the protocol team uses to estimate the expected return for holding an LST position.
+
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/533bdb5b-f9fe-4123-88df-ee85b27bed0f)
+
+It is incorrect that the premium for swETH is intended to be always zero, as mentioned in the judging comment. If the premium always returns zero, the stat calculator for swETH is effectively broken, which is a serious issue. The judging comment is also incorrect in stating there is no vulnerability if the premium is zero. The stat calculator exists for a reason, and an incorrect stat calculator ultimately leads to losses to the protocol, as mentioned in the "Impact" section of my report:
+
+> The purpose of the stats/calculators contracts is to store, augment, and clean data relevant to the LMPs. When the solver proposes a rebalance, the strategy uses the stats contracts to calculate a composite return (score) for the proposed destinations. Using that composite return, it determines if the swap is beneficial for the vault.
+>
+> If a stat calculator provides inaccurate information, it can cause multiple implications that lead to losses to the protocol, such as false signals allowing the unprofitable rebalance to be executed.
+
+Thus, this is a valid High issue.
+
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> After my discussion with the protocol team during the audit period (as shown below), the purpose of the `premium` variable is to determine if an LST is trading at a premium/discount relative to its actual ETH backing. This is one of the signals the protocol team uses to estimate the expected return for holding an LST position.
+> 
+> ![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/533bdb5b-f9fe-4123-88df-ee85b27bed0f)
+> 
+> It is incorrect that the premium for swETH is intended to be always zero, as mentioned in the judging comment. If the premium always returns zero, the stat calculator for swETH is effectively broken, which is a serious issue. The judging comment is also incorrect in stating there is no vulnerability if the premium is zero. The stat calculator exists for a reason, and an incorrect stat calculator ultimately leads to losses to the protocol, as mentioned in the "Impact" section of my report:
+> 
+> > The purpose of the stats/calculators contracts is to store, augment, and clean data relevant to the LMPs. When the solver proposes a rebalance, the strategy uses the stats contracts to calculate a composite return (score) for the proposed destinations. Using that composite return, it determines if the swap is beneficial for the vault.
+> >
+> > If a stat calculator provides inaccurate information, it can cause multiple implications that lead to losses to the protocol, such as false signals allowing the unprofitable rebalance to be executed.
+> 
+> Thus, this is a valid High issue.
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+Can u take a look at this issue @codenutt ? 
+
+**codenutt**
+
+> Can u take a look at this issue @codenutt ?
+
+Yup definitely an issue. Its more an issue with the oracle itself than the calculator, but an issue none the less.
+
+**Evert0x**
+
+Planning to accept escalation and make issue high.
+
+**Evert0x**
+
+Result:
+High
+Unique
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/587/#issuecomment-1748036176): accepted
+
+# Issue H-8: Incorrect approach to tracking the PnL of a DV 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/589 
+
+## Found by 
+xiaoming90
+
+A DV might be incorrectly marked as not sitting in a loss, thus allowing users to burn all the DV shares, locking in all the loss of the DV and the vault shareholders.
+
+## Vulnerability Detail
+
+Let $DV_A$ be a certain destination vault.
+
+Assume that at $T0$, the current debt value (`currentDvDebtValue`) of $DV_A$ is 95 WETH, and the last debt value (`updatedDebtBasis`) is 100 WETH. Since the current debt value has become smaller than the last debt value, the vault is making a loss of 5 WETH since the last rebalancing, so $DV_A$ is sitting at a loss, and users can only burn a limited amount of DestinationVault_A's shares.
+
+Assume that at $T1$, there is some slight rebalancing performed on $DV_A$, and a few additional LP tokens are deposited to it. Thus, its current debt value increased to 98 WETH. At the same time, the `destInfo.debtBasis` and `destInfo.ownedShares` will be updated to the current value. 
+
+Immediately after the rebalancing, $DV_A$ will not be considered sitting in a loss since the `currentDvDebtValue` and `updatedDebtBasis` should be equal now. As a result, users could now burn all the $DV_A$ shares of the LMPVault during withdrawal.
+
+$DV_A$ suddenly becomes not sitting at a loss even though the fact is that it is still sitting at a loss of 5 WETH. The loss has been written off.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L275
+
+```solidity
+File: LMPDebt.sol
+274:         // Neither of these numbers include rewards from the DV
+275:         if (currentDvDebtValue < updatedDebtBasis) {
+276:             // We are currently sitting at a loss. Limit the value we can pull from
+277:             // the destination vault
+278:             currentDvDebtValue = currentDvDebtValue.mulDiv(userShares, totalVaultShares, Math.Rounding.Down);
+279:             currentDvShares = currentDvShares.mulDiv(userShares, totalVaultShares, Math.Rounding.Down);
+280:         }
+```
+
+## Impact
+
+A DV might be incorrectly marked as not sitting in a loss, thus allowing users to burn all the DV shares, locking in all the loss of the DV and the vault shareholders.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L275
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider a more sophisticated approach to track a DV's Profit and Loss (PnL). 
+
+In our example, $DV_A$ should only be considered not making a loss if the price of the LP tokens starts to appreciate and cover the loss of 5 WETH.
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> invalid, it is intended that sitting at a loss is considered by comparing the current debt to the latest recorded debt. Additionally, when it considers not sitting at a loss, it doesn't limit the value can pull but it only pulls enough tokens to withdraw. These withdrawn tokens will not be locked
+
+
+
+**xiaoming9090**
+
+Escalate
+
+The main point of this report is to highlight the issues with the current algorithm/approach of tracking the PnL of a DV and marking it as sitting on a loss or not, which is obviously incorrect, as shown in my report. I have discussed this issue with the protocol team during the audit period, and the impact is undesirable, as shown below.
+
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/5dcf50f0-0efb-44bd-80b9-5c7720da43fa)
+
+It should not be confused with how it is intended to be used in other parts of the protocol, which is unrelated. In addition, the intended approach does not mean that those issues/risks are acceptable and thus considered invalid. If the approach is incorrect, those issues must be flagged during the audit. 
+
+Thus, this is a valid High issue.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> The main point of this report is to highlight the issues with the current algorithm/approach of tracking the PnL of a DV and marking it as sitting on a loss or not, which is obviously incorrect, as shown in my report. I have discussed this issue with the protocol team during the audit period, and the impact is undesirable, as shown below.
+> 
+> ![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/5dcf50f0-0efb-44bd-80b9-5c7720da43fa)
+> 
+> It should not be confused with how it is intended to be used in other parts of the protocol, which is unrelated. In addition, the intended approach does not mean that those issues/risks are acceptable and thus considered invalid. If the approach is incorrect, those issues must be flagged during the audit. 
+> 
+> Thus, this is a valid High issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+Tks for the clarification @xiaoming9090 
+Please review this issue as well @codenutt 
+
+**codenutt**
+
+> Tks for the clarification @xiaoming9090 Please review this issue as well @codenutt
+
+Yup agree with @xiaoming9090 here.
+
+**Evert0x**
+
+Planning to accept escalation and make issue high severity 
+
+@Trumpero 
+
+**Trumpero**
+
+Agree with the high severity
+
+**Evert0x**
+
+Result:
+High
+Unique 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/589/#issuecomment-1748035493): accepted
+
+# Issue H-9: Inflated price due to unnecessary precision scaling 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/600 
 
@@ -724,7 +1068,7 @@ if (existing._initCount == INIT_SAMPLE_COUNT) {
 }
 ```
 
-# Issue H-8: Immediately start getting rewards belonging to others after staking 
+# Issue H-10: Immediately start getting rewards belonging to others after staking 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/603 
 
@@ -868,7 +1212,7 @@ function _stake(address account, uint256 amount) internal {
 }
 ```
 
-# Issue H-9: Differences between actual and cached total assets can be arbitraged 
+# Issue H-11: Differences between actual and cached total assets can be arbitraged 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/611 
 
@@ -970,7 +1314,7 @@ Manual Review
 
 Consider updating $totalAssets_{cached}$ to $totalAssets_{actual}$ before any withdrawal or deposit to mitigate this issue.
 
-# Issue H-10: Gain From LMPVault Can Be Stolen 
+# Issue H-12: Gain From LMPVault Can Be Stolen 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/620 
 
@@ -1024,7 +1368,7 @@ Following are the list of root causes of the issue and some recommendation to mi
 - Users can enter and exit the vault within the same transaction/block. This allows the attacker to leverage the flash-loan facility to reduce the cost of the attack to almost nothing. It is recommended to prevent users from entering and exiting the vault within the same transaction/block. If the user entered the vault in this block, he/she could only exit at the next block.
 - There is no snapshotting to keep track of the deposit to ensure that gains are weighted according to deposit duration. Thus, a whale could deposit right before the `updateDebtReporting` function is triggered and exit the vault afterward and reap most of the gains. Consider implementing snapshotting within the vault.
 
-# Issue H-11: Incorrect pricing for CurveV2 LP Token 
+# Issue H-13: Incorrect pricing for CurveV2 LP Token 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/621 
 
@@ -1137,7 +1481,7 @@ Manual Review
 
 Update the `getPriceInEth` function to ensure that the $internalPriceOracle$ or `assetPrice` return the price of `coins[1]` with `coins[0]` as the quote currency.
 
-# Issue H-12: Incorrect number of shares minted as fee 
+# Issue H-14: Incorrect number of shares minted as fee 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/624 
 
@@ -1226,7 +1570,94 @@ value &= 2.0408163265306122448979591836735\ shares \times \frac{1000\ WETH}{100 
 \end{align}
 $$
 
-# Issue H-13: Maverick oracle can be manipulated 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+> Escalate
+> Users deposit assets via `deposit` to get shares, and amount is also calculated by `_convertToShares`. The protocol can transfer WETH directly to the sink as fees, why mint share? Since the protocol chooses share as the fee, for the sake of fairness, the same formula as for normal users should be used, and no specialization should be made.
+> So, I think it's product design. Not a valid issue.
+
+    You've deleted an escalation for this issue.
+
+**xiaoming9090**
+
+> Escalate Users deposit assets via `deposit` to get shares, and amount is also calculated by `_convertToShares`. The protocol can transfer WETH directly to the sink as fees, why mint share? Since the protocol chooses share as the fee, for the sake of fairness, the same formula as for normal users should be used, and no specialization should be made. So, I think it's product design. Not a valid issue.
+
+Disagree. This is an valid issue.
+1) The fee that the protocol team is entitled to is 20 WETH in my example. Thus, 20 WETH worth of shares must be minted to the protocol. Using the old formula, the protocol team would receive less than 20 WETH, as shown in the report, which is incorrect.
+2) The protocol team has already confirmed this issue. Thus, this is obviously not a product design, as mentioned by the escalator.
+
+**securitygrid**
+
+It is unfair to use two different formulas for user addresses and fee addresses. Since share is choosed as the fee, sink must be treated as a user address. Why let users use formula with losses?
+
+**xiaoming9090**
+
+> It is unfair to use two different formulas for user addresses and fee addresses. Since share is choosed as the fee, sink must be treated as a user address. Why let users use formula with losses?
+
+If the same formula is used, it is not the users who are on the losing end. Instead, it is the protocol team who are on the losing end.
+
+Assume that a user and protocol team are entitled to 20 WETH shares. 
+
+1) The user deposited 20 WETH, and the system should mint to the user 20 WETH worth of shares
+2) The protocol earned 20 WETH of fee, and the system should mint to the user 20 WETH worth of shares
+
+Speaking of the old formula, an important difference is that when minting the users' shares, the total assets and supply increase because the user deposited 20 WETH. Thus, the value of the share remain constant before and after minting the shares. However, when minting the protocol's share, only the total supply increases.
+
+The following shows the user received 20 WETH worth of shares after the minting.
+
+- The system determines by 2 shares should be minted to the users
+
+$$
+\begin{align}
+shares2mint &= fees \times \frac{totalSupply}{totalAsset()} \\
+&= 20\ WETH \times \frac{100\ shares}{1000\ WETH} \\
+&= 2\ shares
+\end{align}
+$$
+
+- Value of the 2 shares after the minting.
+
+$$
+\begin{align}
+value &= 2\ shares \times \frac{1000\ WETH + 20\ WETH}{100 + 2\ shares} \\
+&= 2\ shares \times 10\ WETH\\
+&= 20\ WETH
+\end{align}
+$$
+
+The following shows that the protocol did not receive 20 WETH worth of shares after the minting.
+
+- The system determines that 2 shares should be minted to the protocol based on the old formula:
+
+$$
+\begin{align}
+shares2mint &= fees \times \frac{totalSupply}{totalAsset()} \\
+&= 20\ WETH \times \frac{100\ shares}{1000\ WETH} \\
+&= 2\ shares
+\end{align}
+$$
+
+- Value of the 2 shares after the minting.
+
+$$
+\begin{align}
+value &= 2\ shares \times \frac{1000\ WETH}{100 + 2\ shares} \\
+&= 2\ shares \times 9.8039\ WETH\\
+&= 19.6078\ WETH
+\end{align}
+$$
+
+**securitygrid**
+
+> Speaking of the old formula, an important difference is that when minting the users' shares, the total assets and supply increase because the user deposited 20 WETH. Thus, the value of the share remain constant before and after minting the shares. However, when minting the protocol's share, only the total supply increases.
+
+Agree it. Thanks for your explanation. 
+
+# Issue H-15: Maverick oracle can be manipulated 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/635 
 
@@ -1358,7 +1789,15 @@ Foundry
 ## Recommendation
 Use another calculation for Maverick oracle
 
-# Issue H-14: Aura/Convex rewards are stuck after DOS 
+
+
+## Discussion
+
+**codenutt**
+
+The Mav oracle is only meant to price the value of a boosted position. This is further limited by us only supporting mode "both" positions: https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/README.md?plain=1#L14. The key about mode "both" positions is that they can only contain 1 bin. The maxTotalBinWidth check against the tick spacing, when limited to a single bin, controls the amount of price change we are willing to tolerate. Its default is 50 bps which we are willing to tolerate. 
+
+# Issue H-16: Aura/Convex rewards are stuck after DOS 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/738 
 
@@ -1455,34 +1894,43 @@ Manual Review
 
 Don’t use balanceBefore/After. You could consider using `balanceOf(address(this))` after claiming to see the full amount of tokens in the contract. This assumes that only the specific rewards balance is in the contract.
 
-# Issue M-1: LMPVault exchange rate can potentially be reset by flashloan causing loss of user funds 
+# Issue M-1: `getPriceInEth` in  `TellorOracle.sol` doesn't uses the best practices recommended by Tellor which can cause wrong pricing 
 
-Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/53 
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/351 
 
 ## Found by 
-Jigsaw
-It is possible for the exchange rate of shares/tokens to be reset to 1:1 via flashloan, causing loss of funds for protocol/users. Further detail can be found in this twitter thread: https://twitter.com/kankodu/status/1685320718870032384.
-
+Vagner
+The function `getPriceInEth` it is used to call Tellor oracle to check the prices of different assets but the implementation doesn't respect the best practices recommended by Tellor which can cause wrong pricing.
 ## Vulnerability Detail
-Consider the following thought experiment: 
-
-Lets start with an LMPVault that accepts WETH as the underlying and has share token tokWETH. Lets assume the strategy for the vault involves staking all share tokens in a protocol, which we'll call protocolF, that allows flashloans. Lets further assume that the vault is in a state such that  the exchange rate for 1 tokWETH is 2 WETH ie, to mint 1 tokWETH token at S0 (current state) a user must supply 2 WETH. 
-
-A malicious user would be able to flashloan the entire supply of the LMPVault from protocolF. They would then redeem all underlying assets in the LMPVault and receive 2 WETH for each tokWETH redeemed. They then remint the same number of tokWETH by supplying an equal number of WETH at a 1:1 ratio plus any additional WETH needed to repay a fee denominated in tokWETH, and repay the flashloan, thereby stealing almost half of the underlying WETH in the vault. This would give us S1, a state where the totalSupply of tokWETH is unchanged, however the exchange rate and underlying assets are cut in half to 1:1. 
-
-Submitting this a medium level vulnerability because while user funds are potentially directly at risk, this exploit requires many different factors aligning to be exploited, (singular destination vault etc) and thus is unlikely to happen in (most) cases.
-
+Tellor team has a **Development Checklist** 
+https://docs.tellor.io/tellor/getting-data/user-checklists#development-checklist
+that is important to use when you are using Tellor protocol to protect yourself against stale prices and also to limit dispute attacks. The prices in Tellor protocol can be disputed and changed in case of malicious acting and because of that dispute attacks can happen which would make the prices unstable. `getPriceInEth` calls `getDataBefore`
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L105
+and uses the timestamp returned to check if the prices are stale or not using `DEFAULT_PRICING_TIMEOUT` or `tellorStoredTimeout`
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L107-L112
+The value of the `DEFAULT_PRICING_TIMEOUT` is 2 hours and the frame of time where a dispute could happen is around 12 hours as per Tellor documentation, which could make `getPriceInEth` revert multiple times because of possible dispute attacks that could happen. The way the Tellor protocol recommends to limit the possibility of dispute attacks is by caching the most recent values and timestamps as can seen here in their example 
+https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L9-L11
+Basically every time data is returned it is checked against the last stored values and in case of a dispute attack it will return the last stored undisputed and accurate value as can be seen here 
+https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51-L58
+It is also important to note that the Tellor protocol checks for data returned to not be 0
+https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51
+which is not done in the `getPriceInEth`, so in the case of a 0 value it will be decoded 
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L114
+and then passed into `_denominationPricing`
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L115
+which would return a 0 value that could hurt the protocol.
 ## Impact
-This vulnerability does require the vault to be in a specific state, however as the twitter thread above provided shows, this state is not outside the realms of possibility. The impact of such a transaction would be that all users in the vault have realized ~50% loss of funds due to our malicious actor. 
-
+Medium of because of wrong pricing or multiple revert in case of dispute attacks
 ## Code Snippet
-https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L591
-
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L101-L116
 ## Tool used
+
 Manual Review
 
 ## Recommendation
-Per this issue thread on OpenZeppelins 4626 implementation: https://github.com/OpenZeppelin/openzeppelin-contracts/issues/3800, I recommend implementing a requirement that once a vault has been initialized and funded, totalSupply must remain greater than some threshold. A common threshold used for this is 1 gwei. This ensures that the current exchange rate will always be kept track of and prevent this attack vector. 
+I recommend to use the Tellor example in 
+https://github.com/tellor-io/tellor-caller-liquity/blob/main/contracts/TellorCaller.sol
+and implement mappings to cache the values all the time, similar to how Tellor does it to limit as much as possible dispute attacks and also check for 0 value.
 
 
 
@@ -1490,264 +1938,68 @@ Per this issue thread on OpenZeppelins 4626 implementation: https://github.com/O
 
 **sherlock-admin2**
 
-1 comment(s) were left on this issue during the judging contest.
+2 comment(s) were left on this issue during the judging contest.
 
 **Trumpero** commented:
-> valid, but require a lot of factors which can reduce to low: 
-> - all partcipants must provide liquidity to that lending 
-> - the integrated lending should a mechanism handle the maximum shares holding by each wallet defined by the tokemak ? which is hard and no lending have this mechanism yet ? 
+> low, oracle completeness is considered low similar to chainlink round completeness
+
+**thekmj** commented:
+> great analysis
 
 
 
-# Issue M-2: Malicious attackers can perform a DoS attack by executing Router.approve in advance. 
+**VagnerAndrei26**
 
-Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/346 
+Escalate
+I don't believe this should be taken as a low because of several factors :
+- firstly, sherlock rules states that Chainlink round completeness check are invalid since the new OCR doesn't rely on rounds for reporting the price, it doesn't state that every round completeness is invalid, because the mechanics may differ from oracle to oracle and in some situations it is important to check for everything
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/111457602/91971bf5-44bf-42d2-abff-37b55913f5c1)
+- secondly, because of how Tellor oracle work, anyone can dispute prices and act maliciously by paying the right amount of fees in TRB, that's why the Tellor talks about "dispute attacks" and specify why it is important to protect yourself against them, they acknowledge the risk where bad actors could manipulate the prices for their benefits and if a protocol implementing Tellor oracle does not protect themselves against this, it could hurt it.
+- thirdly, it is important when implementing an external protocol, especially an important one like an oracle, to follow their best practices and recommendations since their methods are battle-tested and any mistakes could lead to loss of funds
 
-## Found by 
-0x73696d616f, VAD37, nobody2018, p0wd3r, shaka, xiaoming90
-Malicious attackers can perform a DoS attack by executing `Router.approve` in advance.
-## Vulnerability Detail
-The protocol has added the `approve` public function in `PeripheryPayments`, which calls `safeApprove`.
-https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/utils/PeripheryPayments.sol#L35-L37
-```solidity
-    function approve(IERC20 token, address to, uint256 amount) public payable {
-        token.safeApprove(to, amount);
-    }
-```
+In the end, I believe that this should not be treated as a simple `Chainlink round completeness check` , since the mechanics are different and the issue is more complex than that, I believe it should be treated highly since an attack path that could lead to loss of funds by manipulating the price exists, which Tokemak protocol doesn't protect against, as recommender by Tellor.
 
-`safeApprove` only allows the allowance to change from 0 to non-zero, not from non-zero to another non-zero value.
-https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.8.1/contracts/token/ERC20/utils/SafeERC20.sol#L39-L60
-```solidity
-    /**
-     * @dev Deprecated. This function has issues similar to the ones found in
-     * {IERC20-approve}, and its usage is discouraged.
-     *
-     * Whenever possible, use {safeIncreaseAllowance} and
-     * {safeDecreaseAllowance} instead.
-     */
-    function safeApprove(
-        IERC20 token,
-        address spender,
-        uint256 value
-    ) internal {
-        // safeApprove should only be called when setting an initial allowance,
-        // or when resetting it to zero. To increase and decrease it, use
-        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
-        require(
-            (value == 0) || (token.allowance(address(this), spender) == 0),
-            "SafeERC20: approve from non-zero to non-zero allowance"
-        );
-        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
-    }
-```
+**sherlock-admin2**
 
-In the `_deposit` function of the Router, the `approve` function is called.
-https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVaultRouterBase.sol#L60-L70
-```solidity
-    function _deposit(
-        ILMPVault vault,
-        address to,
-        uint256 amount,
-        uint256 minSharesOut
-    ) internal returns (uint256 sharesOut) {
-        approve(IERC20(vault.asset()), address(vault), amount);
-        if ((sharesOut = vault.deposit(amount, to)) < minSharesOut) {
-            revert MinSharesError();
-        }
-    }
-```
+ > Escalate
+> I don't believe this should be taken as a low because of several factors :
+> - firstly, sherlock rules states that Chainlink round completeness check are invalid since the new OCR doesn't rely on rounds for reporting the price, it doesn't state that every round completeness is invalid, because the mechanics may differ from oracle to oracle and in some situations it is important to check for everything
+> ![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/111457602/91971bf5-44bf-42d2-abff-37b55913f5c1)
+> - secondly, because of how Tellor oracle work, anyone can dispute prices and act maliciously by paying the right amount of fees in TRB, that's why the Tellor talks about "dispute attacks" and specify why it is important to protect yourself against them, they acknowledge the risk where bad actors could manipulate the prices for their benefits and if a protocol implementing Tellor oracle does not protect themselves against this, it could hurt it.
+> - thirdly, it is important when implementing an external protocol, especially an important one like an oracle, to follow their best practices and recommendations since their methods are battle-tested and any mistakes could lead to loss of funds
+> 
+> In the end, I believe that this should not be treated as a simple `Chainlink round completeness check` , since the mechanics are different and the issue is more complex than that, I believe it should be treated highly since an attack path that could lead to loss of funds by manipulating the price exists, which Tokemak protocol doesn't protect against, as recommender by Tellor.
 
-Since `approve` is a public function, an attacker can execute `approve` once before a user's deposit, making the allowance non-zero. When the user tries to deposit, because the allowance is non-zero, the `approve` function will revert, preventing the user from completing the deposit.
+You've created a valid escalation!
 
-Code PoC:
-```diff
-diff --git a/v2-core-audit-2023-07-14/test/vault/LMPVaultRouter.t.sol b/v2-core-audit-2023-07-14/test/vault/LMPVaultRouter.t.sol
-index 93809f8..71b2e27 100644
---- a/v2-core-audit-2023-07-14/test/vault/LMPVaultRouter.t.sol
-+++ b/v2-core-audit-2023-07-14/test/vault/LMPVaultRouter.t.sol
-@@ -116,7 +116,7 @@ contract LMPVaultRouterTest is BaseTest {
-     }
+To remove the escalation from consideration: Delete your comment.
 
-     // TODO: fuzzing
--    function test_deposit() public {
-+    function test_deposit_after_approve() public {
-         uint256 amount = depositAmount; // TODO: fuzz
-         baseAsset.approve(address(lmpVaultRouter), amount);
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
-@@ -127,6 +127,7 @@ contract LMPVaultRouterTest is BaseTest {
-         lmpVaultRouter.deposit(lmpVault, address(this), amount, minSharesExpected);
+**xiaoming9090**
 
-         // -- now do a successful scenario -- //
-+        lmpVaultRouter.approve(baseAsset, address(lmpVault), amount);
-         _deposit(lmpVault, amount);
-     }
-```
+I agree with the escalator that this should be a valid issue. The root cause is that oracle did not cache the most recent values and timestamps per Tellor's recommendation, leading to dispute attacks. This is similar to the issue I mentioned in my report (https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612).
 
-```shell
-forge test --mt 'test_deposit_after_approve' -vv
-[⠑] Compiling...
-No files changed, compilation skipped
+This issue (https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/351) and Issue https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612 should be an issue of its own, and should not be grouped with the rest. Refer to my escalation (https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612#issuecomment-1748029481) for more details. 
 
-Running 1 test for test/vault/LMPVaultRouter.t.sol:LMPVaultRouterTest
-[FAIL. Reason: SafeERC20: approve from non-zero to non-zero allowance] test_deposit_after_approve() (gas: 297037)
-Test result: FAILED. 0 passed; 1 failed; finished in 893.76ms
+**Evert0x**
 
-Failing tests:
-Encountered 1 failing test in test/vault/LMPVaultRouter.t.sol:LMPVaultRouterTest
-[FAIL. Reason: SafeERC20: approve from non-zero to non-zero allowance] test_deposit_after_approve() (gas: 297037)
+Planning to accept escalation and make issue medium
 
-Encountered a total of 1 failing tests, 0 tests succeeded
-```
-## Impact
-Performing a DoS attack on the core functionality of the protocol.
-## Code Snippet
-- https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/utils/PeripheryPayments.sol#L35-L37
-- https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.8.1/contracts/token/ERC20/utils/SafeERC20.sol#L39-L60
-- https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVaultRouterBase.sol#L60-L70
-## Tool used
+**Evert0x**
 
-Manual Review
+Result:
+Medium
+Unique
 
-## Recommendation
+**sherlock-admin2**
 
-Since `safeApprove` is already deprecated, it is recommended to use `safeIncreaseAllowance` as a replacement for `safeApprove`.
+Escalations have been resolved successfully!
 
-# Issue M-3: Missing access control on #ExtraRewarder.getReward() 
+Escalation status:
+- [VagnerAndrei26](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/351/#issuecomment-1746485268): accepted
 
-Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/369 
-
-## Found by 
-0x007, BPZ, BTK, th13vn, xiaoming90
-
-**`ExtraRewarder.getReward()`** allows users to be claimed for which is not what the protocol inteded and it will lead to undesired consequences.
-
-## Vulnerability Detail
-
-**Note (This was confirmed by the sponsor):** *"Ah I see, yes that would be true and not desired ......... could have undesired consequences for that user."*
-
-The **`getReward()`** function implementation:
-
-```solidity
-    function getReward(address account) public nonReentrant {
-        _updateReward(account);
-        _getReward(account);
-    }
-```
-
-### ***A simple scenarios on how could this result in unexpected behavior for users (Paste this tests in [_getReward](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/test/rewarders/AbstractRewarder.t.sol#L648) contract)***
-
-#### Case 1: Assume an extra rewarder with **`rewardToken == toke`**, **`tokeLockDuration` == 0**.
-
-```solidity
-    function getRewardWrapper(address user) public {
-        rewarder.exposed_updateReward(user);
-        rewarder.exposed_getRewardWrapper(user);
-    }
-
-    function test_AliceClaimsForBob() public {
-        address toke = address(systemRegistry.toke());
-        GPToke gPToke = _setupGpTokeAndTokeRewarder();
-        _runDefaultScenarioGpToke();
-
-        vm.prank(operator);
-        rewarder.setTokeLockDuration(0);
-
-        // Alice is the attacker in this scenario
-        address ALICE = makeAddr("ALICE");
-        // BOB is a long-term staker
-        address BOB = makeAddr("BOB");
-
-        assertEq(IERC20(toke).balanceOf(BOB), 0);
-
-        // Alice called getReward() to claim Bob reward on his behalf.
-        vm.prank(ALICE);
-        getRewardWrapper(BOB);
-
-        // Bob rewards claimed
-        assertEq(IERC20(toke).balanceOf(BOB), 250000);
-    }
-```
-
-***Result:***
-
-```solidity
-Test result: ok. 1 passed; 0 failed; finished in 7.20s
-```
-
-***Test Setup:***
-
-- **`cd v2-core-audit-2023-07-14`**
-- **`forge test --match-contract _getReward --match-test test_AliceClaimsForBob`**
-
-#### Case 2: Bob wanted to wait until **`tokeLockDuration == 0`** to withdraw his rewards
-
-```solidity
-    function test_AliceStakeForBob() public {
-        address toke = address(systemRegistry.toke());
-        GPToke gPToke = _setupGpTokeAndTokeRewarder();
-        _runDefaultScenarioGpToke();
-
-        vm.prank(operator);
-        rewarder.setTokeLockDuration(30 days);
-
-        // Alice is the attacker in this scenario
-        address ALICE = makeAddr("ALICE");
-        // BOB is normal user
-        address BOB = makeAddr("BOB");
-
-        // Bob didn't want to stake but to wait until the tokeLockDuration ends to withdraw his rewards
-
-        // Alice called getReward() to stake Bob reward on his behalf.
-        vm.prank(ALICE);
-        getRewardWrapper(BOB);
-
-        // Bob's reward are now locked in GPToke
-        assertEq(gPToke.balanceOf(BOB), 262374);
-    }
-```
-
-***Result:***
-
-```solidity
-Test result: ok. 1 passed; 0 failed; finished in 8.00s
-```
-
-***Test Setup:***
-
-- **`cd v2-core-audit-2023-07-14`**
-- **`forge test --match-contract _getReward --match-test test_AliceStakeForBob`**
-
-This vulnerability can disrupt the long-term strategies of users who rely on accumulating staking tokens over time, as the attack hinders their ability to do so effectively, and give everyone control over the users rewards.
-
-## Impact
-
-- Users who rely on a long-term strategy of accumulating rewards over time could be adversely affected. Malicious users could claim rewards prematurely, disrupting the intended accumulation process and strategy.
-- Users may need to spend additional gas (Deployment chain is the mainnet) and incur transaction costs to correct the situation.
-- Depending on the jurisdiction and tax regulations, claiming rewards on behalf of others could have tax implications for the victim.
-- Anyone can lock other users rewards into GPToke.
-- The unexpected behavior caused by this vulnerability could affect the stability and reliability of the protocol. Users might lose trust in the platform if they experience such issues.
-
-## Code Snippet
-
-- [ExtraRewarder.sol#L53-L56](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/rewarders/ExtraRewarder.sol#L53-L56)
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-We recommend updating the function as follow since it should only be callable by the main rewarder or the owner of the account: 
-
-```solidity
-    function getReward(address account) public nonReentrant {
-        require(msg.sender == mainReward || msg.sender == account, "Can't claim for others");
-        _updateReward(account);
-        _getReward(account);
-    }
-```
-
-# Issue M-4: Lost rewards when the supply is `0`, which always happens if the rewards are queued before anyone has `StakeTracker` tokens 
+# Issue M-2: Lost rewards when the supply is `0`, which always happens if the rewards are queued before anyone has `StakeTracker` tokens 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/387 
 
@@ -1795,12 +2047,12 @@ function queueNewRewards(uint256 newRewards) external onlyWhitelisted {
 }
 ```
 
-# Issue M-5: `LMPVault._withdraw()` can revert due to an arithmetic underflow 
+# Issue M-3: `LMPVault._withdraw()` can revert due to an arithmetic underflow 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/519 
 
 ## Found by 
-ArmedGoose, Ch\_301, Flora, Nyx, berndartmueller, shaka
+Flora, berndartmueller, nobody2018, shaka, xiaoming90
 `LMPVault._withdraw()` can revert due to an arithmetic underflow.
 
 ## Vulnerability Detail
@@ -1906,7 +2158,7 @@ To mitigate this vulnerability, it is recommended to break the loop within the `
                 }
 ```
 
-# Issue M-6: Unable to withdraw extra rewards 
+# Issue M-4: Unable to withdraw extra rewards 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/565 
 
@@ -2048,7 +2300,7 @@ function _getReward(address account) internal {
 }
 ```
 
-# Issue M-7: Malicious or compromised admin of certain LSTs could manipulate the price 
+# Issue M-5: Malicious or compromised admin of certain LSTs could manipulate the price 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/570 
 
@@ -2110,7 +2362,339 @@ Review each of the supported LSTs and determine how much power the Liquid stakin
 
 For LSTs that are more centralized (e.g., Liquid staking protocol team could update the token contracts or have the ability to update the exchange rate/price to an arbitrary value without any limit), those LSTs should be subjected to additional controls or monitoring, such as implementing some form of circuit breakers if the price deviates beyond a reasonable percentage to reduce the negative impact to Tokemak if it happens.
 
-# Issue M-8: Losses are not distributed equally 
+# Issue M-6: `previewRedeem` and `redeem` functions deviate from the ERC4626 specification 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/577 
+
+## Found by 
+0x73696d616f, 0xSurena, BPZ, BTK, Flora, Kalyan-Singh, Nadin, bin2chen, enfrasico, shaka, talfao, xiaoming90
+
+The `previewRedeem` and `redeem` functions deviate from the ERC4626 specification. As a result, the caller (internal or external) of the `previewRedeem` function might receive incorrect information, leading to the wrong decision being executed.
+
+## Vulnerability Detail
+
+> **Important**
+> The [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) explicitly mentioned that the `LMPVault` must conform with the ERC4626. Thus, issues related to EIP compliance should be considered valid in the context of this audit.
+>
+> **Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?**
+>
+> src/vault/LMPVault.sol should be 4626 compatible
+
+Let the value returned by `previewRedeem` function be $asset_{preview}$ and the actual number of assets obtained from calling the `redeem` function be $asset_{actual}$. 
+
+The following specification of `previewRedeem` function is taken from [ERC4626 specification](https://eips.ethereum.org/EIPS/eip-4626):
+
+> Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block, given current on-chain conditions.
+>
+> MUST return as close to and no more than the exact amount of assets that would be withdrawn in a `redeem` call in the same transaction. I.e. `redeem` should return the same or more `assets` as `previewRedeem` if called in the same transaction.
+
+It mentioned that the `redeem` should return the same or more `assets` as `previewRedeem` if called in the same transaction, which means that it must always be $asset_{preview} \le asset_{actual}$.
+
+However, it is possible that the `redeem` function might return fewer assets than the number of assets previewed by the `previewRedeem` ($asset_{preview} > asset_{actual}$), thus it does not conform to the specification.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L422
+
+```solidity
+File: LMPVault.sol
+422:     function redeem(
+423:         uint256 shares,
+424:         address receiver,
+425:         address owner
+426:     ) public virtual override nonReentrant noNavDecrease ensureNoNavOps returns (uint256 assets) {
+427:         uint256 maxShares = maxRedeem(owner);
+428:         if (shares > maxShares) {
+429:             revert ERC4626ExceededMaxRedeem(owner, shares, maxShares);
+430:         }
+431:         uint256 possibleAssets = previewRedeem(shares); // @audit-info  round down, which is correct because user won't get too many
+432: 
+433:         assets = _withdraw(possibleAssets, shares, receiver, owner);
+434:     }
+```
+
+Note that the `previewRedeem` function performs its computation based on the cached `totalDebt` and `totalIdle`, which might not have been updated to reflect the actual on-chain market condition. Thus, these cached values might be higher than expected.
+
+Assume that `totalIdle` is zero and all WETH has been invested in the destination vaults. Thus, `totalAssetsToPull` will be set to $asset_{preview}$.
+
+If a DV is making a loss, users could only burn an amount proportional to their ownership of this vault. The code will go through all the DVs in the withdrawal queue (`withdrawalQueueLength`) in an attempt to withdraw as many assets as possible. However, it is possible that the `totalAssetsPulled` to be less than  $asset_{preview}$.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L448
+
+```solidity
+File: LMPVault.sol
+448:     function _withdraw(
+449:         uint256 assets,
+450:         uint256 shares,
+451:         address receiver,
+452:         address owner
+453:     ) internal virtual returns (uint256) {
+454:         uint256 idle = totalIdle;
+455:         WithdrawInfo memory info = WithdrawInfo({
+456:             currentIdle: idle,
+457:             assetsFromIdle: assets >= idle ? idle : assets,
+458:             totalAssetsToPull: assets - (assets >= idle ? idle : assets),
+459:             totalAssetsPulled: 0,
+460:             idleIncrease: 0,
+461:             debtDecrease: 0
+462:         });
+463: 
+464:         // If not enough funds in idle, then pull what we need from destinations
+465:         if (info.totalAssetsToPull > 0) {
+466:             uint256 totalVaultShares = totalSupply();
+467: 
+468:             // Using pre-set withdrawalQueue for withdrawal order to help minimize user gas
+469:             uint256 withdrawalQueueLength = withdrawalQueue.length;
+470:             for (uint256 i = 0; i < withdrawalQueueLength; ++i) {
+471:                 IDestinationVault destVault = IDestinationVault(withdrawalQueue[i]);
+472:                 (uint256 sharesToBurn, uint256 totalDebtBurn) = _calcUserWithdrawSharesToBurn(
+473:                     destVault,
+474:                     shares,
+475:                     info.totalAssetsToPull - Math.max(info.debtDecrease, info.totalAssetsPulled),
+476:                     totalVaultShares
+477:                 );
+..SNIP..
+508:         // At this point should have all the funds we need sitting in in the vault
+509:         uint256 returnedAssets = info.assetsFromIdle + info.totalAssetsPulled;
+```
+
+## Impact
+
+It was understood from the protocol team that they anticipate external parties to integrate directly with the LMPVault (e.g., vault shares as collateral). Thus, the LMPVault must be ERC4626 compliance. Otherwise, the caller (internal or external) of the `previewRedeem` function might receive incorrect information, leading to the wrong action being executed.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L422
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Ensure that  $asset_{preview} \le asset_{actual}$. 
+
+Alternatively, document that the `previewRedeem` and `redeem` functions deviate from the ERC4626 specification in the comments and/or documentation.
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> low, not following ERC4626 won't incur risk for the users and protocol 
+> To make sure the assetPreview <= assetActual, users (integrated protocol) should use router to redeem 
+
+
+
+**xiaoming9090**
+
+Escalate
+
+I have confirmed with the protocol team that they anticipate external parties integrating directly with the LMPVault (e.g., vault shares as collateral), as shown below. The router is not applicable in the context of this issue, as ERC4626 is strictly applied to the LMPVault only.
+
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/5af2dcc3-cbe2-4ed0-8600-1e8e90d8d691)
+
+Per the judging docs, the issue will be considered as valid if there is external integrations.
+
+> **EIP compliance with no integrations**: If the protocol does not have external integrations then issues related to code not fully complying with the EIP it is implementing and there are no adverse effects of this, is considered informational
+
+Also, the [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) explicitly mentioned that the `LMPVault` must conform with the ERC4626. Thus, issues related to EIP compliance is considered valid in the context of this audit.
+
+> **Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?**
+>
+> src/vault/LMPVault.sol should be 4626 compatible
+
+In this case, non-conforming to ERC4626 is a valid Medium.
+
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> I have confirmed with the protocol team that they anticipate external parties integrating directly with the LMPVault (e.g., vault shares as collateral), as shown below. The router is not applicable in the context of this issue, as ERC4626 is strictly applied to the LMPVault only.
+> 
+> ![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/5af2dcc3-cbe2-4ed0-8600-1e8e90d8d691)
+> 
+> Per the judging docs, the issue will be considered as valid if there is external integrations.
+> 
+> > **EIP compliance with no integrations**: If the protocol does not have external integrations then issues related to code not fully complying with the EIP it is implementing and there are no adverse effects of this, is considered informational
+> 
+> Also, the [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) explicitly mentioned that the `LMPVault` must conform with the ERC4626. Thus, issues related to EIP compliance is considered valid in the context of this audit.
+> 
+> > **Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?**
+> >
+> > src/vault/LMPVault.sol should be 4626 compatible
+> 
+> In this case, non-conforming to ERC4626 is a valid Medium.
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**midori-fuse**
+
+Escalate
+
+If this issue ends up being valid post-escalation, then #452 #441 #319 #288 #202 should be dupes of this. 
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> If this issue ends up being valid post-escalation, then #452 #441 #319 #288 #202 should be dupes of this. 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**JeffCX**
+
+I thought the EIP complicance issue is valid low in sherlock
+
+**JeffCX**
+
+https://docs.sherlock.xyz/audits/judging/judging
+
+> EIP compliance with no integrations: If the protocol does not have external integrations then issues related to code not fully complying with the EIP it is implementing and there are no adverse effects of this, are considered informational
+
+**0xbtk**
+
+If #577 is considered a medium, then #412 should be a medium too, because as per of the EIP-4626: 
+
+> **It is considered most secure to favor the Vault itself during calculations over its users**.
+
+**Kalyan-Singh**
+
+ #656 shows how deposit function  reverts under certain conditions due to maxDeposit not being eip compliant, I think that will be a genuine problem for external integrators. I think this escalations result should also be reflected there.
+
+**xiaoming9090**
+
+> I thought the EIP complicance issue is valid low in sherlock
+
+For this contest, it was explicitly mentioned in the [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of)  that the `LMPVault` must conform with the ERC4626. Thus, issues related to EIP compliance is considered valid Medium in the context of this audit.
+
+> **Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?**
+>
+> src/vault/LMPVault.sol should be 4626 compatible
+
+**xiaoming9090**
+
+> https://docs.sherlock.xyz/audits/judging/judging
+> 
+> > EIP compliance with no integrations: If the protocol does not have external integrations then issues related to code not fully complying with the EIP it is implementing and there are no adverse effects of this, are considered informational
+
+I have confirmed with the protocol team that they anticipate external parties integrating directly with the LMPVault (e.g., vault shares as collateral), as shown below. Thus, there are external integrations.
+
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/5af2dcc3-cbe2-4ed0-8600-1e8e90d8d691)
+
+**0xSurena**
+
+> > I thought the EIP complicance issue is valid low in sherlock
+> 
+> For this contest, it was explicitly mentioned in the [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) that the `LMPVault` must conform with the ERC4626. Thus, issues related to EIP compliance is considered valid Medium in the context of this audit.
+> 
+> > **Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?**
+> > src/vault/LMPVault.sol should be 4626 compatible
+
+Exactly, it was explicitly mentioned in the [contest page](https://github.com/sherlock-audit/2023-06-tokemak-xiaoming9090/tree/main#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) that code/contract **expected / should** to comply with 4626. 
+
+
+@JeffCX
+> https://docs.sherlock.xyz/audits/judging/judging
+> 
+> > EIP compliance with no integrations: If the protocol does not have external integrations then issues related to code not fully complying with the EIP it is implementing and there are no adverse effects of this, are considered informational
+
+In case of conflict between information in the Contest README vs Sherlock rules, **the README overrides Sherlock rules.** 
+
+**Trumpero**
+
+I believe this issue is a low/info issue evidently. Judging docs of Sherlock clearly stated that: 
+> EIP compliance with no integrations: If the protocol does not have external integrations, then issues related to the code not fully complying with the EIP it is implementing, and there are no adverse effects of this, it is considered informational. 
+
+Therefore, it should be an informational issue. 
+
+The issue must cause a loss of funds (even if unlikely) to be considered as medium
+> Medium: There is a viable scenario (even if unlikely) that could cause the protocol to enter a state where a material amount of funds can be lost.
+
+Furthermore, according to Sherlock's judging docs, the external integrations in the future are not considered valid issues:
+> Future issues: Issues that result out of a future integration/implementation that was not intended (mentioned in the docs/README) or because of a future change in the code (as a fix to another issue) are not valid issues.
+
+**Evert0x**
+
+Current opinion is to accept escalation and make issue medium because of the following judging rule.
+
+> In case of conflict between information in the README vs Sherlock rules, the README overrides Sherlock rules.
+https://docs.sherlock.xyz/audits/judging/judging#iii.-some-standards-observed
+
+
+**Trumpero**
+
+I believe this issue doesn't meet the requirements of a medium issue since it doesn't cause any loss, which is an important requirement to be a valid issue in Sherlock. Even without considering the Sherlock docs about EIP compliance, it only has a low impact, so I don't think it is a valid medium. Historically, the potential risk from a view function has never been accepted as a medium in Sherlock. Additionally, there is no potential loss since users should use the router to redeem, which protects users from any loss by using the minimum redeem amount.
+
+**midori-fuse**
+
+> Historically, the potential risk from a view function has never been accepted as a medium in Sherlock
+
+Disputing this point. [Evidence](https://github.com/sherlock-audit/2022-12-notional-judging/issues/11)
+
+
+
+**xiaoming9090**
+
+The README explicitly stated that `LMPVault.sol` should be 4626 compatible. README overwrites the Sherlock rules. Thus, any 4626 incompatible in this contest would be classified as Medium.
+
+**Evert0x**
+
+The core question is, does the README also override the severity classifications? It states that "Sherlock rules for valid issues" are overwritten. But it's unclear if the severity definitions are included in this, especially because the medium/high definitions are stated above this rule. 
+
+The intention of this sentence is that the protocol can thrive in the context defined by the protocol team. 
+
+In this case, it's clear that the team states that the `LMPVault.sol` should exist in the context of complete ERC4626 compatibility. Making this issue valid. 
+
+Planning to make some changes to the Medium definition and `Hierarchy of truth` language so it will be clear for future contests. 
+
+
+
+
+**Evert0x**
+
+Planning to accept escalation and duplicate with https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/452 https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/441 https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/319 https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/288 https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/202
+
+
+**Evert0x**
+
+Update: planning to add #412 #577 #656 #487 and categorize as a general "Failing to comply with ERC4626" issue family.
+
+**Evert0x**
+
+Result:
+Medium 
+Has Duplicates
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/577/#issuecomment-1748037264): accepted
+- [midori-fuse](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/577/#issuecomment-1748212019): accepted
+
+**Evert0x**
+
+Will add #665 https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/465, https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/503 and https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/731 as duplicates as they point out an issue that will make the contract fail to comply with ERC4626.
+
+Because `_maxMint()` has the possibility to return `uint256.max` it can break the ERC4626 specification of `maxDeposit` of "MUST NOT REVERT"
+
+See https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/665#issuecomment-1780762436
+
+# Issue M-7: Losses are not distributed equally 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/591 
 
@@ -2157,7 +2741,543 @@ Manual Review
 
 Consider burning the shares proportionately across all the DVs during user withdrawal so that loss will be distributed equally among all users regardless of the withdrawal timing.
 
-# Issue M-9: Incorrect handling of Stash Tokens within the `ConvexRewardsAdapter._claimRewards()` 
+# Issue M-8: Malicious users could lock in the NAV/Share of the DV to cause the loss of fees 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/601 
+
+## Found by 
+0x73696d616f, xiaoming90
+
+Malicious users could lock in the NAV/Share of the destination vaults, resulting in a loss of fees.
+
+## Vulnerability Detail
+
+The `_collectFees` function only collects fees whenever the NAV/Share exceeds the last NAV/Share.
+
+During initialization, the `navPerShareHighMark` is set to `1`, effectively 1 ETH per share (1:1 ratio). Assume the following:
+
+- It is at the early stage, and only a few shares (0.5 shares) were minted in the LMPVault
+- There is a sudden increase in the price of an LP token in a certain DV (Temporarily)
+- `performanceFeeBps` is 10%
+
+In this case, the debt value of DV's shares will increase, which will cause LMPVault's debt to increase. This event caused the `currentNavPerShare` to increase to `1.4` temporarily. 
+
+Someone calls the permissionless `updateDebtReporting` function. Thus, the profit will be `0.4 ETH * 0.5 Shares = 0.2 ETH`, which is small due to the number of shares (0.5 shares) in the LMPVault at this point. The fee will be `0.02 ETH` (~40 USD). Thus, the fee earned is very little and almost negligible. 
+
+At the end of the function, the `navPerShareHighMark` will be set to `1.4,` and the highest NAV/Share will be locked forever. After some time, the price of the LP tokens fell back to its expected price range, and the `currentNavPerShare` fell to around `1.05`. No fee will be collected from this point onwards unless the NAV/Share is raised above `1.4`. 
+
+It might take a long time to reach the `1.4` threshold, or in the worst case, the spike is temporary, and it will never reach `1.4` again. So, when the NAV/Share of the LMPVault is 1.0 to 1.4, the protocol only collects `0.02 ETH` (~40 USD), which is too little.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L800
+
+```typescript
+function _collectFees(uint256 idle, uint256 debt, uint256 totalSupply) internal {
+    address sink = feeSink;
+    uint256 fees = 0;
+    uint256 shares = 0;
+    uint256 profit = 0;
+
+    // If there's no supply then there should be no assets and so nothing
+    // to actually take fees on
+    if (totalSupply == 0) {
+        return;
+    }
+
+    uint256 currentNavPerShare = ((idle + debt) * MAX_FEE_BPS) / totalSupply;
+    uint256 effectiveNavPerShareHighMark = navPerShareHighMark;
+
+    if (currentNavPerShare > effectiveNavPerShareHighMark) {
+        // Even if we aren't going to take the fee (haven't set a sink)
+        // We still want to calculate so we can emit for off-chain analysis
+        profit = (currentNavPerShare - effectiveNavPerShareHighMark) * totalSupply;
+        fees = profit.mulDiv(performanceFeeBps, (MAX_FEE_BPS ** 2), Math.Rounding.Up);
+        if (fees > 0 && sink != address(0)) {
+            // Calculated separate from other mints as normal share mint is round down
+            shares = _convertToShares(fees, Math.Rounding.Up);
+            _mint(sink, shares);
+            emit Deposit(address(this), sink, fees, shares);
+        }
+        // Set our new high water mark, the last nav/share height we took fees
+        navPerShareHighMark = currentNavPerShare;
+        navPerShareHighMarkTimestamp = block.timestamp;
+        emit NewNavHighWatermark(currentNavPerShare, block.timestamp);
+    }
+    emit FeeCollected(fees, sink, shares, profit, idle, debt);
+}
+```
+
+## Impact
+
+Loss of fee. Fee collection is an integral part of the protocol; thus the loss of fee is considered a High issue.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L800
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider implementing a sophisticated off-chain algorithm to determine the right time to lock the `navPerShareHighMark` and/or restrict the access to the `updateDebtReporting` function to only protocol-owned addresses.
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> low, collecting fee based on NAV is protocol design, so I think it's fine when the NAV is too large and make the fee can't be accured for the protocol, it's a risk from protocol's choice.
+> Furthermore, in theory more deposits is equivalent with more rewards, so it's likely when the protocol grows bigger, the NAV should increase and the fee can be active again.
+
+
+
+**xiaoming9090**
+
+Escalate
+
+First of all, a risk from the protocol's choice does not mean that the issue is invalid/low. Any risk arising from the protocol's design/architecture and its implementation should be highlighted during an audit.
+
+I have discussed this with the protocol team during the audit period as shown below, and the impact of this issue is undesirable. 
+
+![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/091285ab-1250-49e8-b653-ed3ed3022583)
+
+Using the example in my report, the period where it takes for the NAV/Share of the LMPVault to increase from 1.0 to 1.4 after the attack, the protocol only collects `0.02 ETH` (~40 USD), which shows that the design of the accounting and collection of fees is fundamentally flawed. The protocol team might not have been aware of this attack/issue when designing this fee collection mechanism and assumed that the NAV would progressively increase over a period of time, but did not expect this edge case.
+
+Thus, this is a valid High issue due to a loss of fee.
+
+
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> First of all, a risk from the protocol's choice does not mean that the issue is invalid/low. Any risk arising from the protocol's design/architecture and its implementation should be highlighted during an audit.
+> 
+> I have discussed this with the protocol team during the audit period as shown below, and the impact of this issue is undesirable. 
+> 
+> ![image](https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/102820284/091285ab-1250-49e8-b653-ed3ed3022583)
+> 
+> Using the example in my report, the period where it takes for the NAV/Share of the LMPVault to increase from 1.0 to 1.4 after the attack, the protocol only collects `0.02 ETH` (~40 USD), which shows that the design of the accounting and collection of fees is fundamentally flawed. The protocol team might not have been aware of this attack/issue when designing this fee collection mechanism and assumed that the NAV would progressively increase over a period of time, but did not expect this edge case.
+> 
+> Thus, this is a valid High issue due to a loss of fee.
+> 
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+@codenutt Could you please share your thoughts about this issue? Do you think it is a real issue of the current protocol's fee model which causes a loss of fee, or is it simply another choice of the fee model?
+
+**codenutt**
+
+> @codenutt Could you please share your thoughts about this issue? Do you think it is a real issue of the current protocol's fee model which causes a loss of fee, or is it simply another choice of the fee model?
+
+There are a lot of ways this issue can creep up. It could be something nefarious. It could just be a temporary price spike that would occur normally even if updateDebtReporting was permissioned. We have to do debt reporting fairly frequenting or stale data starts affecting the strategy. However it happens though, we do generally recognize it as an issue and a change we have planned (something we were still solidifying going into the audit). We'll be implementing some decay logic around the high water mark so if we don't see a rise after say 90 days it starts to lower. 
+
+**Evert0x**
+
+Planning to accept escalation and make issue medium as the issue rests on some assumptions, it's also unclear how significant the potential losses exactly are. 
+
+**Evert0x**
+
+Result:
+Medium
+Unique 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/601/#issuecomment-1748034665): accepted
+
+**Evert0x**
+
+Update #469 is a duplicate
+
+# Issue M-9: Price returned by Oracle is not verified 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/604 
+
+## Found by 
+xiaoming90
+
+The price returned by the oracle is not adequately verified, leading to incorrect pricing being accepted.
+
+## Vulnerability Detail
+
+As per the [example](https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51C34-L51C34) provided by Tellor on how to integrate the Tellor oracle into the system, it has shown the need to check that the price returned by the oracle is not zero.
+
+https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51C34-L51C34
+
+```solidity
+function getTellorCurrentValue(bytes32 _queryId)
+	..SNIP..
+    // retrieve most recent 20+ minute old value for a queryId. the time buffer allows time for a bad value to be disputed
+    (, bytes memory data, uint256 timestamp) = tellor.getDataBefore(_queryId, block.timestamp - 20 minutes);
+    uint256 _value = abi.decode(data, (uint256));
+    if (timestamp == 0 || _value == 0) return (false, _value, timestamp);
+```
+
+Thus, the value returned from the `getDataBefore` function should be verified to ensure that the price returned by the oracle is not zero. However, this was not implemented.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L101
+
+```solidity
+File: TellorOracle.sol
+101:     function getPriceInEth(address tokenToPrice) external returns (uint256) {
+102:         TellorInfo memory tellorInfo = _getQueryInfo(tokenToPrice);
+103:         uint256 timestamp = block.timestamp;
+104:         // Giving time for Tellor network to dispute price
+105:         (bytes memory value, uint256 timestampRetrieved) = getDataBefore(tellorInfo.queryId, timestamp - 30 minutes);
+106:         uint256 tellorStoredTimeout = uint256(tellorInfo.pricingTimeout);
+107:         uint256 tokenPricingTimeout = tellorStoredTimeout == 0 ? DEFAULT_PRICING_TIMEOUT : tellorStoredTimeout;
+108: 
+109:         // Check that something was returned and freshness of price.
+110:         if (timestampRetrieved == 0 || timestamp - timestampRetrieved > tokenPricingTimeout) {
+111:             revert InvalidDataReturned();
+112:         }
+113: 
+114:         uint256 price = abi.decode(value, (uint256));
+115:         return _denominationPricing(tellorInfo.denomination, price, tokenToPrice);
+116:     }
+```
+
+## Impact
+
+The protocol relies on the oracle to provide accurate pricing for many critical operations, such as determining the debt values of DV, calculators/stats used during the rebalancing process, NAV/shares of the LMPVault, and determining how much assets the users should receive during withdrawal.
+
+If an incorrect value of zero is returned from Tellor, affected assets within the protocol will be considered worthless.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L101
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Update the affected function as follows.
+
+```diff
+function getPriceInEth(address tokenToPrice) external returns (uint256) {
+    TellorInfo memory tellorInfo = _getQueryInfo(tokenToPrice);
+    uint256 timestamp = block.timestamp;
+    // Giving time for Tellor network to dispute price
+    (bytes memory value, uint256 timestampRetrieved) = getDataBefore(tellorInfo.queryId, timestamp - 30 minutes);
+    uint256 tellorStoredTimeout = uint256(tellorInfo.pricingTimeout);
+    uint256 tokenPricingTimeout = tellorStoredTimeout == 0 ? DEFAULT_PRICING_TIMEOUT : tellorStoredTimeout;
+
+    // Check that something was returned and freshness of price.
+-   if (timestampRetrieved == 0 || timestamp - timestampRetrieved > tokenPricingTimeout) {
++	if (timestampRetrieved == 0 || value == 0 || timestamp - timestampRetrieved > tokenPricingTimeout) {
+        revert InvalidDataReturned();
+    }
+
+    uint256 price = abi.decode(value, (uint256));
+    return _denominationPricing(tellorInfo.denomination, price, tokenToPrice);
+}
+```
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> low, similar to chainlink round completeness
+
+
+
+**xiaoming9090**
+
+Escalate
+
+The reason why chainlink round completeness is considered invalid/low in Sherlock is that the OCR does not rely on rounds for reporting anymore. Not validating the price returned from the oracle is zero is a much more serious issue and is different from the round completeness issue related to lagged/outdated price.
+
+If an incorrect value of zero is returned from Tellor, affected assets within the protocol will be considered worthless. Thus, it is important that this check must be done. In addition, per the [example](https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51C34-L51C34) provided by Tellor on how to integrate the Tellor oracle into the system, it has shown the need to check that the price returned by the oracle is not zero.
+
+Thus, this is a valid High issue.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> The reason why chainlink round completeness is considered invalid/low in Sherlock is that the OCR does not rely on rounds for reporting anymore. Not validating the price returned from the oracle is zero is a much more serious issue and is different from the round completeness issue related to lagged/outdated price.
+> 
+> If an incorrect value of zero is returned from Tellor, affected assets within the protocol will be considered worthless. Thus, it is important that this check must be done. In addition, per the [example](https://github.com/tellor-io/tellor-caller-liquity/blob/3ed91e4b15f0bac737f2966e36805ade3daf8162/contracts/TellorCaller.sol#L51C34-L51C34) provided by Tellor on how to integrate the Tellor oracle into the system, it has shown the need to check that the price returned by the oracle is not zero.
+> 
+> Thus, this is a valid High issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+Hello @xiaoming9090, according to the information I found in the [Tellor documentation](https://docs.tellor.io/tellor/getting-data/solidity-integration#reading-data) under the section "Solidity Integration," the [provided example](https://github.com/tellor-io/sampleUsingTellor/blob/master/contracts/SampleUsingTellor.sol) in the documentation differs from the example you provided, and it lacks a check for the 0-value.
+
+Could you please provide more details about the source of your example?
+
+**xiaoming9090**
+
+Hey @Trumpero, the repo can be found in the [Tellor's User Checklist](https://docs.tellor.io/tellor/getting-data/user-checklists#ensure-that-functions-do-not-use-old-tellor-values), which is a guide that the protocol team need to go through before using the Tellor oracle.
+
+One point to make is that [Chainlink](https://docs.chain.link/data-feeds/getting-started#examine-the-sample-contract) or Tellor would not provide an example that checks for zero-value in all their examples. The reason is that not all use cases require zero-value checks. Suppose a simple protocol performs a non-price-sensitive operation, such as fetching a price to emit an event for the protocol team's internal reference. In that case, there is no need to check for zero value.
+
+However, for Tokemak and many other protocols involving financial transactions, it is critical that the price of assets cannot be zero due to errors from Oracle. Thus, a zero-values check is consistently implemented on such kind of protocols. Therefore, we need to determine if a zero-values check is required on a case-by-case basis. In this case, Tokemak falls under the latter group.
+
+**Trumpero**
+
+Tks @xiaoming9090, understand it now. Seem a valid issue for me @codenutt. 
+The severity for me should be medium, since it assumes the tellor oracle returns a 0 price value. 
+
+**Evert0x**
+
+Planning to accept escalation and make issue medium
+
+**codenutt**
+
+@Trumpero  Our goal with the check is to verify that a price was actually found. Based on their contract checking for timestamp == 0 is sufficient as it returns both 0 and 0 in this state: https://github.com/tellor-io/tellorFlex/blob/bdefcab6d90d4e86c34253fdc9e1ec778f370c3c/contracts/TellorFlex.sol#L450
+
+**Trumpero**
+
+Based on the sponsor's comment, I think this issue is low. 
+
+**Evert0x**
+
+Planning to reject escalation and keep issue state as is @xiaoming9090 
+
+
+**xiaoming9090**
+
+The [sponsor's comment](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/604#issuecomment-1778408999) simply explains the purpose/intention of the [if-condition](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L110) is to check that a price is returned from Tellor Oracle. However, this does not necessarily mean that it is fine that the returned price is zero OR there is no risk if the return price is zero.
+
+The protocol uses two (2) oracles (Chainlink and Tellor). In their Chainlink oracle's implementation, the protocol has explicitly checked that the price returned is more than zero. Otherwise, the oracle will revert. Thus, it is obvious that zero price is not accepted to the protocol based on the codebase.
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/oracles/providers/ChainlinkOracle.sol#L113
+```solidity
+if (
+	roundId == 0 || price <= 0 || updatedAt == 0 || updatedAt > timestamp
+		|| updatedAt < timestamp - tokenPricingTimeout
+) revert InvalidDataReturned();
+```
+However, this was not consistently implemented in their Tellor's oracle, which is highlighted in this report.
+
+In addition, as pointed out in my earlier escalation. for Tokemak and many other protocols involving financial transactions, it is critical that the price of assets cannot be zero. Thus, a zero-values check is consistently implemented on such kind of protocols. Some examples are as follows:
+- AAVE - [Source Code](https://github.com/aave/aave-protocol/blob/4b4545fb583fd4f400507b10f3c3114f45b8a037/contracts/misc/ChainlinkProxyPriceProvider.sol#L78) and [Documentation](https://docs.aave.com/developers/v/1.0/developing-on-aave/the-protocol/price-oracle)
+- Compound - [Source Code](https://github.com/compound-finance/comet/blob/22cf923b6263177555272dde8b0791703895517d/contracts/pricefeeds/WBTCPriceFeed.sol#L69)
+
+**Evert0x**
+
+Thanks @xiaoming9090 
+
+The core issue is that 0 value isn't handled well. There is no counter argument to this in the recent comments.
+
+Planning to accept escalation and make issue medium
+
+
+
+
+
+**Evert0x**
+
+@Trumpero let me know if you agree with this. 
+
+**Trumpero**
+
+I agree that this issue should be a medium within the scope of Tokemak contracts.
+
+**Evert0x**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/604/#issuecomment-1748034104): accepted
+
+# Issue M-10: Malicious users could use back old values 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612 
+
+## Found by 
+ctf\_sec, xiaoming90
+
+Malicious users could use back old values to manipulate the price.
+
+## Vulnerability Detail
+
+Per the [Teller's User Checklist](https://docs.tellor.io/tellor/getting-data/user-checklists#ensure-that-functions-do-not-use-old-tellor-values), it is possible that a potential attacker could go back in time to find a desired value in the event that a Tellor value is disputed. Following is the extract taken from the checklist:
+
+> **Ensure that functions do not use old Tellor values** 
+>
+> In the event where a Tellor value is disputed, the disputed value is removed & previous values remain. Prevent potential attackers from going back in time to find a desired value with a check in your contracts. [This repo](https://github.com/tellor-io/tellor-caller-liquity/blob/main/contracts/TellorCaller.sol) is a great reference for integrating Tellor.
+
+The current implementation lack measure to guard against such attack.
+
+```solidity
+File: TellorOracle.sol
+101:     function getPriceInEth(address tokenToPrice) external returns (uint256) {
+102:         TellorInfo memory tellorInfo = _getQueryInfo(tokenToPrice);
+103:         uint256 timestamp = block.timestamp;
+104:         // Giving time for Tellor network to dispute price
+105:         (bytes memory value, uint256 timestampRetrieved) = getDataBefore(tellorInfo.queryId, timestamp - 30 minutes);
+106:         uint256 tellorStoredTimeout = uint256(tellorInfo.pricingTimeout);
+107:         uint256 tokenPricingTimeout = tellorStoredTimeout == 0 ? DEFAULT_PRICING_TIMEOUT : tellorStoredTimeout;
+108: 
+109:         // Check that something was returned and freshness of price.
+110:         if (timestampRetrieved == 0 || timestamp - timestampRetrieved > tokenPricingTimeout) {
+111:             revert InvalidDataReturned();
+112:         }
+113: 
+114:         uint256 price = abi.decode(value, (uint256));
+115:         return _denominationPricing(tellorInfo.denomination, price, tokenToPrice);
+116:     }
+```
+
+Anyone can submit a dispute to Tellor by paying a fee. The disputed values are immediately removed upon submission, and the previous values will remain. The attacks are profitable as long as the economic gains are higher than the dispute fee. For instance, this can be achieved by holding large amounts of vault shares (e.g., obtained using own funds or flash-loan) to amplify the gain before manipulating the assets within it to increase the values.
+
+## Impact
+
+Malicious users could manipulate the price returned by the oracle to be higher or lower than expected. The protocol relies on the oracle to provide accurate pricing for many critical operations, such as determining the debt values of DV, calculators/stats used during the rebalancing process, NAV/shares of the LMPVault, and determining how much assets the users should receive during withdrawal.
+
+Incorrect pricing would result in many implications that lead to a loss of assets, such as users withdrawing more or fewer assets than expected due to over/undervalued vaults or strategy allowing an unprofitable rebalance to be executed.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L101
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Update the affected function as per the recommendation in [Teller's User Checklist](https://docs.tellor.io/tellor/getting-data/user-checklists#ensure-that-functions-do-not-use-old-tellor-values).
+
+```diff
+function getPriceInEth(address tokenToPrice) external returns (uint256) {
+    TellorInfo memory tellorInfo = _getQueryInfo(tokenToPrice);
+    uint256 timestamp = block.timestamp;
+    // Giving time for Tellor network to dispute price
+    (bytes memory value, uint256 timestampRetrieved) = getDataBefore(tellorInfo.queryId, timestamp - 30 minutes);
+    uint256 tellorStoredTimeout = uint256(tellorInfo.pricingTimeout);
+    uint256 tokenPricingTimeout = tellorStoredTimeout == 0 ? DEFAULT_PRICING_TIMEOUT : tellorStoredTimeout;
+
+    // Check that something was returned and freshness of price.
+    if (timestampRetrieved == 0 || timestamp - timestampRetrieved > tokenPricingTimeout) {
+        revert InvalidDataReturned();
+    }
+    
++    if (timestampRetrieved > lastStoredTimestamps[tellorInfo.queryId]) {
++        lastStoredTimestamps[tellorInfo.queryId] = timestampRetrieved;
++        lastStoredPrices[tellorInfo.queryId] = value;
++    } else {
++    	value = lastStoredPrices[tellorInfo.queryId]
++    }
+
+    uint256 price = abi.decode(value, (uint256));
+    return _denominationPricing(tellorInfo.denomination, price, tokenToPrice);
+}
+```
+
+
+
+## Discussion
+
+**xiaoming9090**
+
+Escalate
+
+This is wrongly duplicated to Issue 744. In Issue 744, it highlights that the 30-minute delay is too large, which is different from the issue highlighted here. This issue is about a different vulnerability highlighted in Tellor checklist where malicious users can re-use back an old value that has nothing to do with the 30-minute delay being too large.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> This is wrongly duplicated to Issue 744. In Issue 744, it highlights that the 30-minute delay is too large, which is different from the issue highlighted here. This issue is about a different vulnerability highlighted in Tellor checklist where malicious users can re-use back an old value that has nothing to do with the 30-minute delay being too large.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**JeffCX**
+
+Escalate
+
+Agree with LSW. 
+
+#844 is a duplicate of this issue as well, the issue that only highlight the stale price feed should be de-dup together! Thanks!
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> Agree with LSW. 
+> 
+> #844 is a duplicate of this issue as well, the issue that only highlight the stale price feed should be de-dup together! Thanks!
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+Agree with the @xiaoming9090, this issue should not be a duplication of #744 
+Please check this as well @codenutt 
+
+**Evert0x**
+
+Planning to accept both escalations and make #612 a valid medium with #844 as a duplicate.
+
+**codenutt**
+
+> Agree with the @xiaoming9090, this issue should not be a duplication of #744 Please check this as well @codenutt
+
+Yup agree. Thx!
+
+**Evert0x**
+
+Result:
+Medium
+Has Duplicates
+
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612/#issuecomment-1748029481): accepted
+- [JEFFCX](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/612/#issuecomment-1748625856): accepted
+
+# Issue M-11: Incorrect handling of Stash Tokens within the `ConvexRewardsAdapter._claimRewards()` 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/632 
 
@@ -2229,7 +3349,171 @@ Manual Review
 ## Recommendation
 To accurately determine whether a token is a stash token, it is advised to perform a low-level `balanceOf()` call to the token and subsequently validate the call's success.
 
-# Issue M-10: Vault cannot be added back into the vault registry 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> #649 is a duplicate of this issue.
+
+    You've deleted an escalation for this issue.
+
+# Issue M-12: `navPerShareHighMark` not reset to 1.0 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/661 
+
+## Found by 
+berndartmueller, xiaoming90
+
+The `navPerShareHighMark` was not reset to 1.0 when a vault had been fully exited, leading to a loss of fee.
+
+## Vulnerability Detail
+
+The LMPVault will only collect fees if the current NAV (`currentNavPerShare`) is more than the last NAV (`effectiveNavPerShareHighMark`).
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L800
+
+```solidity
+File: LMPVault.sol
+800:     function _collectFees(uint256 idle, uint256 debt, uint256 totalSupply) internal {
+801:         address sink = feeSink;
+802:         uint256 fees = 0;
+803:         uint256 shares = 0;
+804:         uint256 profit = 0;
+805: 
+806:         // If there's no supply then there should be no assets and so nothing
+807:         // to actually take fees on
+808:         if (totalSupply == 0) {
+809:             return;
+810:         }
+811: 
+812:         uint256 currentNavPerShare = ((idle + debt) * MAX_FEE_BPS) / totalSupply;
+813:         uint256 effectiveNavPerShareHighMark = navPerShareHighMark;
+814: 
+815:         if (currentNavPerShare > effectiveNavPerShareHighMark) {
+816:             // Even if we aren't going to take the fee (haven't set a sink)
+817:             // We still want to calculate so we can emit for off-chain analysis
+818:             profit = (currentNavPerShare - effectiveNavPerShareHighMark) * totalSupply;
+```
+
+Assume the current LMPVault state is as follows:
+
+- totalAssets = 15 WETH
+- totalSupply = 10 shares
+- NAV/share = 1.5
+- effectiveNavPerShareHighMark = 1.5
+
+Alice owned all the remaining shares in the vault, and she decided to withdraw all her 10 shares. As a result, the `totalAssets` and `totalSupply` become zero. It was found that when all the shares have been exited, the `effectiveNavPerShareHighMark` is not automatically reset to 1.0.
+
+Assume that at some point later, other users started to deposit into the LMPVault, and the vault invests the deposited WETH to profitable destination vaults, resulting in the real/actual NAV rising from 1.0 to 1.49 over a period of time.
+
+The system is designed to collect fees when there is a rise in NAV due to profitable investment from sound rebalancing strategies. However, since the `effectiveNavPerShareHighMark` has been set to 1.5 previously, no fee is collected when the NAV rises from 1.0 to 1.49, resulting in a loss of fee.
+
+## Impact
+
+Loss of fee. Fee collection is an integral part of the protocol; thus the loss of fee is considered a High issue.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L448
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider resetting the `navPerShareHighMark` to 1.0 whenever a vault has been fully exited.
+
+```diff
+function _withdraw(
+    uint256 assets,
+    uint256 shares,
+    address receiver,
+    address owner
+) internal virtual returns (uint256) {
+..SNIP..
+    _burn(owner, shares);
+    
++	if (totalSupply() == 0) navPerShareHighMark = MAX_FEE_BPS;
+
+    emit Withdraw(msg.sender, receiver, owner, returnedAssets, shares);
+
+    _baseAsset.safeTransfer(receiver, returnedAssets);
+
+    return returnedAssets;
+}
+```
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> invalid, the fee is only collected when navPerShareHighMark increases. In the example, it should collect fee only at the first rising of NAV from 1.0 to 1.5; the second rising (even after withdrawing all) isn't counted. 
+
+
+
+**xiaoming9090**
+
+Escalate
+
+Please double-check with the protocol team. The protocol should always collect a fee when a profit is earned from the vaults. The fact that it only collects fees during the first rise of NAV, but not the second rise of NAV is a flaw in the design and leads to loss of protocol fee. Thus, this is a valid High issue.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> Please double-check with the protocol team. The protocol should always collect a fee when a profit is earned from the vaults. The fact that it only collects fees during the first rise of NAV, but not the second rise of NAV is a flaw in the design and leads to loss of protocol fee. Thus, this is a valid High issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+@codenutt, I believe this issue revolves around the protocol's intention regarding how to handle the protocol fee. Given that @xiaoming9090 and I hold differing viewpoints on this intention, I would greatly appreciate hearing your thoughts on the matter.
+
+**codenutt**
+
+Agree with @xiaoming9090 here. We should be resetting the high water mark. Do believe it should only be a Medium, though. We've actually already fixed it as it was brought up as a Low issue in our parallel Halborn audit as well. If there was a complete outflow of funds and the high water mark was high enough that we wouldn't see us over coming it any time soon, there'd be no reason we wouldn't just shut down the vault and spin up a new one. 
+
+**xiaoming9090**
+
+@codenutt Thanks for your response!
+
+@hrishibhat @Trumpero Fee collection is an integral part of the protocol. Based on Sherlock's judging criteria and historical decisions, loss of protocol fee revenue is considered a Medium and above.
+
+**Evert0x**
+
+Planning to accept escalation and make issue medium. 
+
+If @xiaoming9090 can provide a strong argument for high, I will consider assigning high severity. But it's unclear if the losses are material.
+
+**Evert0x**
+
+Result:
+Medium
+Unique
+
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/661/#issuecomment-1748030561): accepted
+
+# Issue M-13: Vault cannot be added back into the vault registry 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/674 
 
@@ -2313,7 +3597,339 @@ Clear the `_vaultsByType` state when removing the vault from the registry.
 
 ```
 
-# Issue M-11: LMPVault: DoS when `feeSink` balance hits `perWalletLimit` 
+# Issue M-14: LMPVault.updateDebtReporting could underflow because of subtraction before addition 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/675 
+
+## Found by 
+0x007
+`debt = totalDebt - prevNTotalDebt + afterNTotalDebt` in [LMPVault._updateDebtReporting](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L781-L792) could underflow and breaking a core functionality of the protocol.
+
+## Vulnerability Detail
+`debt = totalDebt - prevNTotalDebt + afterNTotalDebt` where prevNTotalDebt equals `(destInfo.currentDebt * originalShares) / Math.max(destInfo.ownedShares, 1)` and the key to finding a scenario for underflow starts by noting that each value deducted from totalDebt is calculated as `cachedCurrentDebt.mulDiv(sharesToBurn, cachedDvShares, Math.Rounding.Up)`
+
+LMPDebt
+```solidity
+...
+L292    totalDebtBurn = cachedCurrentDebt.mulDiv(sharesToBurn, cachedDvShares, Math.Rounding.Up);
+...
+L440    uint256 currentDebt = (destInfo.currentDebt * originalShares) / Math.max(destInfo.ownedShares, 1);
+L448    totalDebtDecrease = currentDebt;
+```
+
+Let:
+`totalDebt = destInfo.currentDebt = destInfo.debtBasis = cachedCurrentDebt = cachedDebtBasis = 11`
+`totalSupply = destInfo.ownedShares = cachedDvShares = 10`
+
+That way:
+`cachedCurrentDebt * 1 / cachedDvShares = 1.1` but totalDebtBurn would be rounded up to 2
+
+`sharesToBurn` could easily be 1 if there was a loss that changes the ratio from `1:1.1` to `1:1`. Therefore `currentDvDebtValue = 10 * 1 = 10`
+
+```solidity
+if (currentDvDebtValue < updatedDebtBasis) {
+    // We are currently sitting at a loss. Limit the value we can pull from
+    // the destination vault
+    currentDvDebtValue = currentDvDebtValue.mulDiv(userShares, totalVaultShares, Math.Rounding.Down);
+    currentDvShares = currentDvShares.mulDiv(userShares, totalVaultShares, Math.Rounding.Down);
+}
+
+// Shouldn't pull more than we want
+// Or, we're not in profit so we limit the pull
+if (currentDvDebtValue < maxAssetsToPull) {
+    maxAssetsToPull = currentDvDebtValue;
+}
+
+// Calculate the portion of shares to burn based on the assets we need to pull
+// and the current total debt value. These are destination vault shares.
+sharesToBurn = currentDvShares.mulDiv(maxAssetsToPull, currentDvDebtValue, Math.Rounding.Up);
+```
+
+### Steps
+* call redeem 1 share and previewRedeem request 1 `maxAssetsToPull`
+* 2 debt would be burn
+* Therefore totalDebt = 11-2 = 9
+* call another redeem 1 share and request another 1 `maxAssetsToPull`
+* 2 debts would be burn again and 
+* totalDebt would be 7, but prevNTotalDebt = 11 * 8 // 10 = 8
+
+Using 1, 10 and 11 are for illustration and the underflow could occur in several other ways. E.g if we had used `100,001`, `1,000,010` and `1,000,011` respectively.
+
+## Impact
+_updateDebtReporting could underflow and break a very important core functionality of the protocol. updateDebtReporting is so critical that funds could be lost if it doesn't work. Funds could be lost both when the vault is in profit or at loss.
+
+If in profit, users would want to call updateDebtReporting so that they get more asset for their shares (based on the profit).
+
+If in loss, the whole vault asset is locked and withdrawals won't be successful because the Net Asset Value is not supposed to reduce by such action (noNavDecrease modifier). Net Asset Value has reduced because the loss would reduce totalDebt, but the only way to update the totalDebt record is by calling updateDebtReporting. And those impacted the most are those with large funds. The bigger the fund, the more NAV would decrease by withdrawals.
+
+## Code Snippet
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L781-L792
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L440-L449
+https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L295
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+Add before subtracting. ETH in circulation is not enough to cause an overflow.
+
+```solidity
+- debt = totalDebt - prevNTotalDebt + afterNTotalDebt
++ debt = totalDebt + afterNTotalDebt - prevNTotalDebt
+```
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> invalid, let get through each step in the description: 
+> 0, we have, totalSupply = 10, totalDebt = 11
+> 1, redeem 1 share --> totalSupply = 10 - 1 = 9
+> 2, 2 debts will be burn -> totalDebt = 11 - 2 = 9 
+> --> invalid here because the withdraw function contains the noNAVDecrease, but as we can see here is newNav = 9 / 9 = 1 < oldNav = 11 / 10 = 1.1 
+
+
+
+**bizzyvinci**
+
+Escalate
+
+This issue is valid.
+
+Using 10 and 11 is just for illustration and there are many possibilities as pointed out in the report as well.
+> Using 1, 10 and 11 are for illustration and the underflow could occur in several other ways. E.g if we had used 100,001, 1,000,010 and 1,000,011 respectively.
+
+And here's a PoC that could be added to [LMPVaultMintingTests](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/test/vault/LMPVault-Withdraw.t.sol#L245) which would revert due to arithmetic underflow in updateDebtReporting
+
+```solidity
+function test_675() public {
+        uint num0 = 1_000_000;
+        uint num1 = 1_000_001;
+        uint num2 = 1_000_002;
+
+        // Mock root price of underlyerOne to 1,000,001 (ether-like)
+        // test debtvalue is correct and where you want it
+        _mockRootPrice(address(_underlyerOne), num1 * 1e12);
+        assertEq(num1, _destVaultOne.debtValue(num0));
+
+        // deposit
+        // rebalance
+        _accessController.grantRole(Roles.SOLVER_ROLE, address(this));
+        _accessController.grantRole(Roles.LMP_FEE_SETTER_ROLE, address(this));
+
+        // User is going to deposit 1,000,010 asset
+        _asset.mint(address(this), num0);
+        _asset.approve(address(_lmpVault), num0);
+        _lmpVault.deposit(num0, address(this));
+
+        // Deployed all asset to DV1
+        _underlyerOne.mint(address(this), num1);
+        _underlyerOne.approve(address(_lmpVault), num1);
+        _lmpVault.rebalance(
+            address(_destVaultOne),
+            address(_underlyerOne), // tokenIn
+            num1,
+            address(0), // destinationOut, none when sending out baseAsset
+            address(_asset), // baseAsset, tokenOut
+            num0
+        );
+
+        // totalDebt should equal num2 now
+        assertEq(num2, _lmpVault.totalDebt());
+        assertEq(num2, _lmpVault.totalAssets());
+
+        // also get mock price back where we want it
+        _mockRootPrice(address(_underlyerOne), 1 ether);
+        assertEq(num0, _destVaultOne.debtValue(num0));
+
+        // start attack
+        _lmpVault.redeem(1, address(this), address(this));
+        assertEq(num2 - 2, _lmpVault.totalDebt());
+        assertEq(num2 - 2, _lmpVault.totalAssets());
+        
+        _lmpVault.redeem(1, address(this), address(this));
+        assertEq(num2 - 4, _lmpVault.totalDebt());
+        assertEq(num2 - 4, _lmpVault.totalAssets());
+
+        _lmpVault.updateDebtReporting(_destinations);
+    }
+
+```
+
+In this case I used 1,000,000 against 1 wei, therefore it's **within NAV change tolerance**. And it illustrates the root cause I'm trying to point out.
+
+```solidity
+debt = totalDebt - prevNTotalDebt + afterNTotalDebt
+```
+
+**`totalDebt` could be less than `prevNTotalDebt`.**
+
+prevNTotalDebt is [currentDebt](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L440) which is debt during rebalance scaled to reflect current supply.
+```solidity
+uint256 currentDebt = (destInfo.currentDebt * originalShares) / Math.max(destInfo.ownedShares, 1);
+```
+
+However, a value that is rounded up is subtracted from `totalDebt`.
+```solidity
+// https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L295C9-L295C98
+totalDebtBurn = cachedCurrentDebt.mulDiv(sharesToBurn, cachedDvShares, Math.Rounding.Up);
+
+// https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L489
+info.debtDecrease += totalDebtBurn;
+
+// https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L518C13-L518C44
+totalDebt -= info.debtDecrease;
+```
+
+So, the goal is to get rounding up against totalDebt that is less than the rounding down in prevNTotalDebt.
+
+The PoC achieves that by getting a double rounding up against totalDebt, which would result in just 1 rounding down in prevNTotalDebt. If you notice the attack section, each redemption of 1 share would burn 2 debts (instead of burning 1.000_001 debt because of rounding up).
+
+P.S: Big Kudos to @Trumpero for taking the time to comment on invalid issues 🫡
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> This issue is valid.
+> 
+> Using 10 and 11 is just for illustration and there are many possibilities as pointed out in the report as well.
+> > Using 1, 10 and 11 are for illustration and the underflow could occur in several other ways. E.g if we had used 100,001, 1,000,010 and 1,000,011 respectively.
+> 
+> And here's a PoC that could be added to [LMPVaultMintingTests](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/test/vault/LMPVault-Withdraw.t.sol#L245) which would revert due to arithmetic underflow in updateDebtReporting
+> 
+> ```solidity
+> function test_675() public {
+>         uint num0 = 1_000_000;
+>         uint num1 = 1_000_001;
+>         uint num2 = 1_000_002;
+> 
+>         // Mock root price of underlyerOne to 1,000,001 (ether-like)
+>         // test debtvalue is correct and where you want it
+>         _mockRootPrice(address(_underlyerOne), num1 * 1e12);
+>         assertEq(num1, _destVaultOne.debtValue(num0));
+> 
+>         // deposit
+>         // rebalance
+>         _accessController.grantRole(Roles.SOLVER_ROLE, address(this));
+>         _accessController.grantRole(Roles.LMP_FEE_SETTER_ROLE, address(this));
+> 
+>         // User is going to deposit 1,000,010 asset
+>         _asset.mint(address(this), num0);
+>         _asset.approve(address(_lmpVault), num0);
+>         _lmpVault.deposit(num0, address(this));
+> 
+>         // Deployed all asset to DV1
+>         _underlyerOne.mint(address(this), num1);
+>         _underlyerOne.approve(address(_lmpVault), num1);
+>         _lmpVault.rebalance(
+>             address(_destVaultOne),
+>             address(_underlyerOne), // tokenIn
+>             num1,
+>             address(0), // destinationOut, none when sending out baseAsset
+>             address(_asset), // baseAsset, tokenOut
+>             num0
+>         );
+> 
+>         // totalDebt should equal num2 now
+>         assertEq(num2, _lmpVault.totalDebt());
+>         assertEq(num2, _lmpVault.totalAssets());
+> 
+>         // also get mock price back where we want it
+>         _mockRootPrice(address(_underlyerOne), 1 ether);
+>         assertEq(num0, _destVaultOne.debtValue(num0));
+> 
+>         // start attack
+>         _lmpVault.redeem(1, address(this), address(this));
+>         assertEq(num2 - 2, _lmpVault.totalDebt());
+>         assertEq(num2 - 2, _lmpVault.totalAssets());
+>         
+>         _lmpVault.redeem(1, address(this), address(this));
+>         assertEq(num2 - 4, _lmpVault.totalDebt());
+>         assertEq(num2 - 4, _lmpVault.totalAssets());
+> 
+>         _lmpVault.updateDebtReporting(_destinations);
+>     }
+> 
+> ```
+> 
+> In this case I used 1,000,000 against 1 wei, therefore it's **within NAV change tolerance**. And it illustrates the root cause I'm trying to point out.
+> 
+> ```solidity
+> debt = totalDebt - prevNTotalDebt + afterNTotalDebt
+> ```
+> 
+> **`totalDebt` could be less than `prevNTotalDebt`.**
+> 
+> prevNTotalDebt is [currentDebt](https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L440) which is debt during rebalance scaled to reflect current supply.
+> ```solidity
+> uint256 currentDebt = (destInfo.currentDebt * originalShares) / Math.max(destInfo.ownedShares, 1);
+> ```
+> 
+> However, a value that is rounded up is subtracted from `totalDebt`.
+> ```solidity
+> // https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L295C9-L295C98
+> totalDebtBurn = cachedCurrentDebt.mulDiv(sharesToBurn, cachedDvShares, Math.Rounding.Up);
+> 
+> // https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L489
+> info.debtDecrease += totalDebtBurn;
+> 
+> // https://github.com/sherlock-audit/2023-06-tokemak/blob/main/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L518C13-L518C44
+> totalDebt -= info.debtDecrease;
+> ```
+> 
+> So, the goal is to get rounding up against totalDebt that is less than the rounding down in prevNTotalDebt.
+> 
+> The PoC achieves that by getting a double rounding up against totalDebt, which would result in just 1 rounding down in prevNTotalDebt. If you notice the attack section, each redemption of 1 share would burn 2 debts (instead of burning 1.000_001 debt because of rounding up).
+> 
+> P.S: Big Kudos to @Trumpero for taking the time to comment on invalid issues 🫡
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+The POC looks good to me. Could you please review this issue, @codenutt?
+
+**codenutt**
+
+Yup I'd agree @Trumpero , looks valid. Thanks @bizzyvinci !
+
+**Evert0x**
+
+Planning to accept escalation and make issue valid.
+
+**Evert0x**
+
+@Trumpero do you think this deserves the high severity label? 
+
+**Trumpero**
+
+I think it should be medium since this case just happens in some specific cases 
+
+**Evert0x**
+
+Result:
+Medium
+Unique 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [bizzyvinci](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/675/#issuecomment-1748545702): accepted
+
+# Issue M-15: LMPVault: DoS when `feeSink` balance hits `perWalletLimit` 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/679 
 
@@ -2377,7 +3993,7 @@ Manual Review
 
 Allow `feeSink` to exceeds `perWalletLimit`.
 
-# Issue M-12: Incorrect amount given as input to `_handleRebalanceIn` when `flashRebalance` is called 
+# Issue M-16: Incorrect amount given as input to `_handleRebalanceIn` when `flashRebalance` is called 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/701 
 
@@ -2521,43 +4137,7 @@ function flashRebalance(
 
 
 
-# Issue M-13: Potential vulnerabilities with a 30-Minute Delay in TellorOracle 
-
-Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/744 
-
-## Found by 
-0x73696d616f, 0xWeiss, Ch\_301, Qeew, ctf\_sec, inspecktor, lemonmon, xiaoming90
-
-The protocol primarily uses Chainlink as its primary oracle service but falls back to Tellor in case Chainlink is down. However, the Tellor oracle is used with a 30-minute delay, which introduces a  potential risk.
-
-## Vulnerability Detail
-In the TellorOracle.sol contract, the following statement is used to retrieve data from the Tellor oracle:
-
-(bytes memory data, uint256 timestamp) = getDataBefore(_queryId, block.timestamp - 30 minutes);
-
-The vulnerability arises from the 30-minute delay in the getPriceInEth function of the TellorOracle contract. This delay means that, in the event of a fallback to Tellor, the system will be using a price that is at least 30 minutes old, which can lead to significant discrepancies in volatile markets.
-
-There is a recent analysis by [Liquity ](https://www.liquity.org/blog/tellor-issue-and-fix) in which they are using 15 minutes for ETH after making some analysis of ETH volatility behaviour. 
-
-Basically, there is a tradeoff between the volatility of an asset and the dispute time. More time is safer to have time to dispute but more likely to read an old value. 
-
-## Impact
-
-The 30-minute delay could lead to a larger differential between the price the system sees and the real market price. This is particularly important in the case of a fallback, as it increases the chances of the system using a stale price. Liquity chose 15 minute to give plenty of time for disputers to respond to fake prices while keeping any adverse impacts on the system to a minimum. Using a 30-minute delay could lead to adverse impacts that Liquity sought to minimize.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/oracles/providers/TellorOracle.sol#L105
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Reduce the delay to a shorter period, such as 15 minutes, as used by Liquity.
-
-# Issue M-14: OOG / unexpected reverts due to incorrect usage of staticcall. 
+# Issue M-17: OOG / unexpected reverts due to incorrect usage of staticcall. 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/822 
 
@@ -2664,7 +4244,578 @@ According to the monorepo [here](https://github.com/balancer/balancer-v2-monorep
 
 This ensures gas isn't burnt up without reason.
 
-# Issue M-15: Slashing during `LSTCalculatorBase.sol` deployment can show bad apr for months 
+
+
+## Discussion
+
+**JeffCX**
+
+Escalate
+
+politely dispute that the severity is high because the transaction that meant to check the reentrancy burn too much gas and can revert and can block withdraw of fund or at least constantly burn all amount of gas and make user lose money
+
+in a single transaction, the cost burnt can by minimal, but suppose the user send 10000 transaction, the gas burnt lose add up 
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> politely dispute that the severity is high because the transaction that meant to check the reentrancy burn too much gas and can revert and can block withdraw of fund or at least constantly burn all amount of gas and make user lose money
+> 
+> in a single transaction, the cost burnt can by minimal, but suppose the user send 10000 transaction, the gas burnt lose add up 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This issue should be a Low. 
+> 
+> The reason is that it will only consume all gas if the staticcall reverts, which means a re-entrancy is detected. For normal usage of the application, there will not be any re-entrancy. Thus, the normal users who use the protocol in the intended manner will not be affected by this issue. 
+> 
+> It will only consume all the gas of attackers trying to carry out a re-entrancy attack against the protocol. In this case, the attacker will not get the gas refund when the re-entrancy detection reverts. 
+> 
+> The loss of gas refunding for the attacker is not a valid issue in Sherlock since we are protecting the users, not the malicious users attempting to perform a re-entrancy attack or someone using the features in an unintended manner that triggers the re-entrancy revert. In addition, the loss of gas refund is not substantial enough to be considered a Medium since the chance of innocent users triggering a re-entrancy is close to zero in real life.
+> 
+> From the perspective of a smart contract, if an innocent external contract accidentally calls the Balancer protocol that passes the control to the contract and then calls Tokemak, which triggers a re-entrancy revert, such a contract is not operating correctly and should be fixed.
+
+    You've deleted an escalation for this issue.
+
+**JeffCX**
+
+With full respect to senior watson's comment
+
+> The reason is that it will only consume all gas if the staticcall reverts, which means a re-entrancy is detected
+
+I have to dispute the statement above,
+
+Please review the duplicate issue #837 as well
+
+the old balancer reentrancy check version does not cap the staticcall gas limit
+
+but the new version add the 10000 gas cap
+
+https://github.com/balancer/balancer-v2-monorepo/blob/227683919a7031615c0bc7f144666cdf3883d212/pkg/pool-utils/contracts/lib/VaultReentrancyLib.sol#L43-L55
+
+and the balancer team already clearly state that the static call always revert even the reentrancy is not detected
+
+```
+// However, use a static call so that it can be a view function (even though the function is non-view).
+// This allows the library to be used more widely, as some functions that need to be protected might be
+// view.
+//
+// This staticcall always reverts, but we need to make sure it doesn't fail due to a re-entrancy attack.
+// Staticcalls consume all gas forwarded to them on a revert caused by storage modification.
+// By default, almost the entire available gas is forwarded to the staticcall,
+// causing the entire call to revert with an 'out of gas' error.
+//
+// We set the gas limit to 10k for the staticcall to
+// avoid wasting gas when it reverts due to storage modification.
+// `manageUserBalance` is a non-reentrant function in the Vault, so calling it invokes `_enterNonReentrant`
+// in the `ReentrancyGuard` contract, reproduced here:
+//
+//    function _enterNonReentrant() private {
+//        // If the Vault is actually being reentered, it will revert in the first line, at the `_require` that
+//        // checks the reentrancy flag, with "BAL#400" (corresponding to Errors.REENTRANCY) in the revertData.
+//        // The full revertData will be: `abi.encodeWithSignature("Error(string)", "BAL#400")`.
+//        _require(_status != _ENTERED, Errors.REENTRANCY);
+//
+//        // If the Vault is not being reentered, the check above will pass: but it will *still* revert,
+//        // because the next line attempts to modify storage during a staticcall. However, this type of
+//        // failure results in empty revertData.
+//        _status = _ENTERED;
+//    }
+```
+
+use not capping the gas limit of static call means the user are constantly waste too much gas (let us say for a single call the user waste and lose 0.01 ETH at gas), after 20000 transaction the loss is cumulatively 200 ETH and has no upper limit of loss
+
+because the reason above
+
+the balancer push a PR fix for this issue specifically, can see the PR
+
+https://github.com/balancer/balancer-v2-monorepo/pull/2467
+
+gas is either wasted or transaction revert and block withdraw, which is both really bad for user in long term, so the severity should be high instead of medium
+
+```
+//  If the Vault is not being reentered, the check above will pass: but it will *still* revert,
+//  because the next line attempts to modify storage during a staticcall. However, this type of
+//  failure results in empty revertData.
+```
+
+**carrotsmuggler**
+
+The comment by the LSW is wrong. The POC clearly shows 90% of gas is consumed even when no re-entrancy is detected, i.e. for normal usage of the protocol.
+
+When there is reentrancy, the entire transaction reverts. If there is no reentrancy, the static call still reverts due to a state change. There is no reentrancy for the situation given in the POC.
+
+The `manageUserBalance` call always does a state change. When a state change is encountered during a static call, the entire gas is burnt up and the execution reverts. This happens irrespective of reentrancy conditions.
+
+**xiaoming9090**
+
+Thanks @JeffCX and @carrotsmuggler for your explanation. You are correct that the issue will happen irrespective of reentrancy conditions. The `manageUserBalance` function will trigger the `_enterNonReentrant` modifier. If there is no re-entrancy, this [line of code](https://github.com/balancer/balancer-v2-monorepo/pull/2467/files#diff-36f155e03e561d19a594fba949eb1929677863e769bd08861397f4c7396b0c71R66) will result in a state change that consume all the gas pass to it. I have deleted the escalation.
+
+**Trumpero**
+
+Hello JeffCX, I believe that the loss of gas might not qualify as a valid high. According to the guidelines in Sherlock's [documentation](https://docs.sherlock.xyz/audits/judging/judging#viii.-list-of-issue-categories-that-are-considered-valid), the OOG matter will be deemed a medium severity issue. It could be considered high only in cases where it results in a complete blockage of all user funds indefinitely.
+
+**JeffCX**
+
+Sir, I agree the OOG does not block user withdraw forever
+
+but because the static call always revert and waste 63/64 gas when withdraw, the remaining 1 / 64 gas has to be enough to complete the transaction.
+
+this means user are force to overpaying 100x more gas to complete the withdraw from balancer vault
+
+**we can make a analogy:**
+
+the protocol open a bank, user put 10K fund into the bank, and the user should only pays for 1 USD transaction fee when withdraw the fund, 
+
+but the bank said, sorry because of a bug, everyone has to pay 100 USD to withdraw the fund, and this 100x cost applies every user in every withdrawal transaction, then the result is the withdraw is not really usable and cause consistent loss of fund
+
+this 100x gas applies to all user in every withdrawal transaction that use the balancer vault and the loss of fund from gas has no upper bound, so I think a high severity is still justified.
+
+
+
+**Trumpero**
+
+Hello, @JeffCX,
+
+The Out Of Gas (OOG) situation renders users unable to call a method of the contracts due to insufficient gas. On the other hand, your issue poses a risk where users:
+
+- Couldn't call a method due to insufficient gas
+- Users can pay more fees to trigger the function
+
+From what I observe, the impact of your issue appears to be a subset of the impact caused by an OOG. Therefore, if the OOG is considered medium, your issue should be equal to or less than medium in severity. I would appreciate it if you could share your opinion on this.
+
+**JeffCX**
+
+Yeap, it is a subset of impact caused by OOG, 
+
+so Users can pay more fees to trigger the function, but as I already shown, every user needs to pay 100x gas more in every withdrawal transaction for balancer vault, so the lose of fund as gas is cumulatively high :)
+
+**Trumpero**
+
+I believe that in the scenario of an OOG/DOS, it represents the worst-case scenario for your issue. 
+This is because when an OOG/DOS happens, users will pay a gas fee without any results, resulting in a loss of their gas. Hence, the impact of an OOG can be rephrased as follows: "users pay 100x gas fee but can't use the function". On the other hand, your issue states that "users pay 100x gas fee but sometime it fails". Is that correct?
+
+**JeffCX**
+
+user can pay 100x gas and use the function as long as the remaining 1/64 gas can complete the executions.
+
+in my original report
+
+https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/837
+
+the impact I summarized is:
+
+> the function may waste too much gas and result in an out of gas error and can block function call such as withdraw
+
+emm as for
+
+> users pay 100x gas fee but sometime it fails
+
+as long as user pay a lot of gas (which they should not, transaction can be processed), and if they do not pay that amount of gas, transaction fails
+
+and sir, just a friendly reminder
+
+my original escalation is the severity should be high instead of medium based on the impact 👍 
+
+
+
+
+**Trumpero**
+
+Certainly, I comprehend that you are aiming to elevate the severity level of this issue. However, my stance remains that this issue should be classified as medium due to the following rationale:
+
+Let's consider a situation where Alice intends to initiate 2 methods. Method A results in a denial-of-service (DOS) due to an out-of-gas (OOG) scenario, while method B aligns with your described issue.
+
+1. Alice expends 1 ETH as a gas fee but is unable to execute method A. Even when she attempts to allocate 10 ETH for the gas fee, she still cannot trigger method A.
+
+2. Simultaneously, Alice expends 1 ETH as a gas fee but encounters an inability to execute method B. However, when she allocates 10 ETH for the gas fee, she successfully triggers method B.
+
+Consequently, we observe that method A costs Alice 11 ETH as a gas fee without any return, whereas method B costs Alice the same 11 ETH, yet she gains the opportunity to execute it. Hence, we can infer that method A is more susceptible than method B.
+
+**JeffCX**
+
+Sir, I don't think the method A and method B example applies in the codebase and in this issue
+
+there is only one method for user to withdraw share from the vault
+
+I can add more detail to explain how this impact withdraw using top-down approach
+
+User can withdraw by calling withdraw in LMPVault.sol and triggers [_withdraw](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L414)
+
+the _withdraw calls the method [_calcUserWithdrawSharesToBurn](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L472)
+
+this calls [LMPDebt._calcUserWithdrawSharesToBurn](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L442)
+
+we need to know the [debt value](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L253) by calling destVault.debtValue
+
+this calls this [line of code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/DestinationVault.sol#L150)
+
+this calls the [oracle code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/DestinationVault.sol#L328)
+
+```solidity
+uint256 price = _systemRegistry.rootPriceOracle().getPriceInEth(_underlying);
+```
+
+then if the dest vault is the balancer vault, balancer reetrancy check is triggered to waste 63 / 64 waste in [oracle code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/oracles/providers/BalancerLPComposableStableEthOracle.sol#L36)
+
+so there is no function A and function B call
+
+as long as user can withdraw and wants to withdraw share from balancer vault, 100x gas overpayment is required
+
+
+
+**JeffCX**
+
+I think we can treat this issue same as "transaction missing slippage protection"
+
+missing slippage protection is consider a high severity finding, but user may not lose million in one single transaction, the loss depends on user's trading amount
+
+the loss amount for individual transaction can be small but there are be a lot of user getting frontrunning and the missing slippage cause consistent leak of value
+
+all the above character applies to this finding as well
+
+can refer back to my first analogy
+
+> the protocol open a bank, user put 10K fund into the bank, and the user should only pays for 1 USD transaction fee when withdraw the fund,
+
+but the bank said, sorry because of a bug, everyone has to pay 100 USD to withdraw the fund, and this 100x cost applies every user in every withdrawal transaction, then the result is the withdraw is not really usable and cause consistent loss of fund
+
+this 100x gas applies to all user in every withdrawal transaction that use the balancer vault and the loss of fund from gas has no upper bound, so I think a high severity is still justified.
+
+**Evert0x**
+
+> I think we can treat this issue same as "transaction missing slippage protection"
+
+You are referring to the gas usage here? Putting a limit on the gas is not a task for the protocol, this is a task for the wallet someone is using. 
+
+As the escalation comment states
+> in a single transaction, the cost burnt can by minimal
+
+Impact is not significant enough for a high severity.
+
+Current opinion is to reject escalation and keep issue medium severity. 
+
+**JeffCX**
+
+> Putting a limit on the gas is not a task for the protocol
+
+sir, please read the report again, the flawed logic in the code charge user 100x gas in every transaction in every withdrawal
+
+> in a single transaction, the cost burnt can by minimal
+
+the most relevant comments is https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/822#issuecomment-1765550141
+
+and https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/822#issuecomment-1769126560
+
+idk how do state it more clearly, emm if you put money in the bank, you expect to pay 1 USD for withdrawal transaction fee, but every time you have to pay 100 USD withdrawal fee because of the bug
+
+this cause loss of fund for every user in every transaction for not only you but every user...
+
+
+
+
+
+**Evert0x**
+
+@JeffCX what are the exact numbers on the withdrawal costs? E.g. if I want to withdraw $10k, how much gas can I expect to pay? If this is a significant amount I can see the argument for
+> How to identify a high issue:
+> Definite loss of funds without limiting external conditions.
+
+But it's not clear how much this will be assuming current mainnet conditions. 
+
+**JeffCX**
+
+I write a simpe POC
+
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import "forge-std/Test.sol";
+import "forge-std/console.sol";
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+contract MockERC20 is ERC20 {
+    constructor()ERC20("MyToken", "MTK")
+    {}
+
+    function mint(address to, uint256 amount) public {
+        _mint(to, amount);
+    }
+}
+
+interface ICheckRetrancy {
+    function checkRentrancy() external;
+}
+
+contract RentrancyCheck {
+
+
+    uint256 state = 10;
+
+    function checkRentrancy() external {
+        address(this).staticcall(abi.encodeWithSignature("hihi()"));
+    }
+
+    function hihi() public {
+        state = 11;
+    }
+
+}
+
+contract Vault {
+
+    address balancerAddr;
+    bool checkRentrancy;
+
+    constructor(bool _checkRentrancy, address _balancerAddr) {
+        checkRentrancy = _checkRentrancy;
+        balancerAddr = _balancerAddr;
+    }
+
+    function toggleCheck(bool _state) public {
+        checkRentrancy = _state;
+    }
+
+    function withdraw(address token, uint256 amount) public {
+
+        if(checkRentrancy) {
+            ICheckRetrancy(balancerAddr).checkRentrancy();
+        }
+
+        IERC20(token).transfer(msg.sender, amount);
+    
+    }
+
+}
+
+
+contract CounterTest is Test {
+
+    using stdStorage for StdStorage;
+    StdStorage stdlib;
+
+    MockERC20 token;
+    Vault vault;
+    RentrancyCheck rentrancyCheck;
+
+    address user = vm.addr(5201314);
+
+    function setUp() public {
+    
+        token = new MockERC20();
+        rentrancyCheck = new RentrancyCheck();
+        vault = new Vault(false, address(rentrancyCheck));
+        token.mint(address(vault), 100000000 ether);
+
+        vm.deal(user, 100 ether);
+    
+        // vault.toggleCheck(true);
+
+    }
+
+    function testPOC() public {
+
+        uint256 gas = gasleft();
+        uint256 amount = 100 ether;
+        vault.withdraw(address(token), amount);
+        console.log(gas - gasleft());
+
+    }
+
+}
+
+```
+
+the call is 
+
+```
+if check reentrancy flag is true
+
+user withdraw -> 
+check reentrancy staticall revert and consume most of the gas 
+-> withdraw completed
+```
+
+or
+
+```
+if check reentrancy flag is false
+
+user withdraw ->
+-> withdraw completed
+```
+
+note first we do not check the reentrancy
+
+```solidity
+// vault.toggleCheck(true);
+```
+
+we run
+
+```solidity
+forge test -vvv --match-test "testPOC" --fork-url "https://eth.llamarpc.com" --gas-limit 10000000
+```
+
+the gas cost is 42335
+
+```
+Running 1 test for test/Counter.t.sol:CounterTest
+[PASS] testPOC() (gas: 45438)
+Logs:
+  42335
+```
+
+then we uncomment the vault.toggleCheck(true) and check the reentrancy that revert in staticcall
+
+```solidity
+vault.toggleCheck(true);
+```
+
+we run the same test again, this is the output, as we can see the gas cost surge
+
+```
+Running 1 test for test/Counter.t.sol:CounterTest
+[PASS] testPOC() (gas: 9554791)
+Logs:
+  9551688
+```
+
+then we can use this  python scirpt to estimate how much gas is overpaid as lost of fund
+
+```python
+regular =  42313
+
+overpaid = 9551666
+
+# gas price: 45 gwei -> 0.000000045
+
+cost = 0.000000045 * (overpaid - regular);
+
+print(cost)
+```
+
+the cost is 
+
+```solidity
+0.427920885 ETH
+```
+
+in a single withdraw, assume user lost 0.427 ETH,
+
+if 500 user withdraw 20 times each and the total number of transaction is 10000
+
+the lose on gas is 10000 * 0.427 ETH
+
+**JeffCX**
+
+note that the more gas limit user set, the more fund user lose in gas
+
+but we are interested in what the lowest amount of gas limit user that user can set the pay for withdrawal transaction
+
+I did some fuzzing
+
+that number is 1800000 unit of gas
+
+the command to run the test is
+
+```solidity
+forge test -vvv --match-test "testPOC" --fork-url "https://eth.llamarpc.com" --gas-limit 1800000
+```
+
+setting gas limit lower than 1800000 unit of gas is likely to revert in out of gas
+
+under this setting, the overpaid transaction cost is 1730089
+
+```solidity
+Running 1 test for test/Counter.t.sol:CounterTest
+[PASS] testPOC() (gas: 1733192)
+Logs:
+  1730089
+```
+
+in other words,
+
+in each withdrawal for every user, user can lose 0.073 ETH, (1730089 uint of gas * 45 gwei -> 0.000000045 ETH)
+
+assume there are 1000 user, each withdraw 10 times, they make 1000 * 10 = 100_00 transaction
+
+so the total lost is 100_00 * 0.07 = 700 ETH 
+
+in reality the gas is more than that because user may use more than 1800000 unit of gas to finalize the withdrawal transaction
+
+**Evert0x**
+
+@JeffCX thanks for putting in the effort to make this estimation.
+
+But as far as I can see, your estimation doesn't use the actual contracts in scope. But maybe that's irrelevant to make your point. 
+
+This seems like the key sentence 
+> in each withdrawal for every user, user can lose 0.073 ETH, 
+
+This is an extra $100-$150 dollars per withdrawal action. 
+
+This is not a very significant amount in my opinion. I assume an optimized withdrawal transaction will cost between  $20-$50. So the difference is not as big. 
+
+**JeffCX**
+
+> Sir, I don't think the method A and method B example applies in the codebase and in this issue
+> 
+> there is only one method for user to withdraw share from the vault
+> 
+> I can add more detail to explain how this impact withdraw using top-down approach
+> 
+> User can withdraw by calling withdraw in LMPVault.sol and triggers [_withdraw](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L414)
+> 
+> the _withdraw calls the method [_calcUserWithdrawSharesToBurn](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L472)
+> 
+> this calls [LMPDebt._calcUserWithdrawSharesToBurn](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/LMPVault.sol#L442)
+> 
+> we need to know the [debt value](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/libs/LMPDebt.sol#L253) by calling destVault.debtValue
+> 
+> this calls this [line of code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/DestinationVault.sol#L150)
+> 
+> this calls the [oracle code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/vault/DestinationVault.sol#L328)
+> 
+> ```solidity
+> uint256 price = _systemRegistry.rootPriceOracle().getPriceInEth(_underlying);
+> ```
+> 
+> then if the dest vault is the balancer vault, balancer reetrancy check is triggered to waste 63 / 64 waste in [oracle code](https://github.com/sherlock-audit/2023-06-tokemak/blob/5d8e902ce33981a6506b1b5fb979a084602c6c9a/v2-core-audit-2023-07-14/src/oracles/providers/BalancerLPComposableStableEthOracle.sol#L36)
+> 
+> so there is no function A and function B call
+> 
+> as long as user can withdraw and wants to withdraw share from balancer vault, 100x gas overpayment is required
+
+the POC is a simplified flow of this 
+
+it is ok to disagree sir:)
+
+**Evert0x**
+
+Result:
+Medium
+Has Duplicates
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [JEFFCX](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/822/#issuecomment-1745242587): rejected
+
+# Issue M-18: Slashing during `LSTCalculatorBase.sol` deployment can show bad apr for months 
 
 Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/824 
 
@@ -2704,4 +4855,220 @@ Manual Review
 ## Recommendation
 
 It is recommended to initialize the APR with a specified value, rather than calculate it over the initial 9 days. 9 day window is not good enough to get an accurate APR, and can be easily manipulated by a slashing event.
+
+
+
+## Discussion
+
+**codenutt**
+
+This behavior is acceptable. If we happen to see a slash > 12 bps over the initial 9 days, yes, we set it to 0. It increases the ramp time for that LST so pools with that LST will be set aside for a while until some APR (incentive, etc) comes up. For larger slashes that are more material (> 25bps), we have a 90 day penalty anyway.
+
+# Issue M-19: curve admin can drain pool via reentrancy (equal to execute emergency withdraw and rug tokenmak fund by third party) 
+
+Source: https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/862 
+
+## Found by 
+ctf\_sec
+
+curve admin can drain pool via reentrancy (equal to execute emergency withdraw and rug tokenmak fund)
+
+## Vulnerability Detail
+
+A few curve liquidity is pool is well in-scope:
+
+```solidity
+Curve Pools
+
+Curve stETH/ETH: 0x06325440D014e39736583c165C2963BA99fAf14E
+Curve stETH/ETH ng: 0x21E27a5E5513D6e65C4f830167390997aA84843a
+Curve stETH/ETH concentrated: 0x828b154032950C8ff7CF8085D841723Db2696056
+Curve stETH/frxETH: 0x4d9f9D15101EEC665F77210cB999639f760F831E
+Curve rETH/ETH: 0x6c38cE8984a890F5e46e6dF6117C26b3F1EcfC9C
+Curve rETH/wstETH: 0x447Ddd4960d9fdBF6af9a790560d0AF76795CB08
+Curve rETH/frxETH: 0xbA6c373992AD8ec1f7520E5878E5540Eb36DeBf1
+Curve cbETH/ETH: 0x5b6C539b224014A09B3388e51CaAA8e354c959C8
+Curve cbETH/frxETH: 0x548E063CE6F3BaC31457E4f5b4e2345286274257
+Curve frxETH/ETH: 0xf43211935C781D5ca1a41d2041F397B8A7366C7A
+Curve swETH/frxETH: 0xe49AdDc2D1A131c6b8145F0EBa1C946B7198e0BA
+```
+
+one of the pool is 0x21E27a5E5513D6e65C4f830167390997aA84843a
+
+https://etherscan.io/address/0x21E27a5E5513D6e65C4f830167390997aA84843a#code#L1121
+
+Admin of curve pools can easily drain curve pools via reentrancy or via the `withdraw_admin_fees` function. 
+
+```solidity
+@external
+def withdraw_admin_fees():
+    receiver: address = Factory(self.factory).get_fee_receiver(self)
+
+    amount: uint256 = self.admin_balances[0]
+    if amount != 0:
+        raw_call(receiver, b"", value=amount)
+
+    amount = self.admin_balances[1]
+    if amount != 0:
+        assert ERC20(self.coins[1]).transfer(receiver, amount, default_return_value=True)
+
+    self.admin_balances = empty(uint256[N_COINS])
+```
+
+if admin of the curve can set a receiver to a malicious smart contract and reenter withdraw_admin_fees a 1000 times to drain the pool even the admin_balances is small
+
+the line of code
+
+```solidty
+raw_call(receiver, b"", value=amount)
+```
+
+trigger the reentrancy
+
+This is a problem because as stated by the tokemak team:
+
+>> In case of external protocol integrations, are the risks of external contracts pausing or executing an emergency withdrawal acceptable? If not, Watsons will submit issues related to these situations that can harm your protocol's functionality.
+> 
+> Pausing or emergency withdrawals are not acceptable for Tokemak.
+
+As you can see above, pausing or emergency withdrawals are not acceptable, and this is possible for cuve pools so this is a valid issue according to the protocol and according to the read me
+
+## Impact
+curve admins can drain pool via reentrancy
+
+## Code Snippet
+https://etherscan.io/address/0x21E27a5E5513D6e65C4f830167390997aA84843a#code#L1121
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+N/A
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**Trumpero** commented:
+> invalid, as the submission stated: "Admin of curve pools can easily drain curve pools via reentrancy", so no vulnerability for tokemak here 
+
+
+
+**JeffCX**
+
+Escalate
+
+as the protocol docs mentioned
+
+https://audits.sherlock.xyz/contests/101
+
+> In case of external protocol integrations, are the risks of external contracts pausing or executing an emergency withdrawal acceptable? If not, Watsons will submit issues related to these situations that can harm your protocol's functionality.
+
+> Pausing or emergency withdrawals are not acceptable for Tokemak.
+
+in the issue got exploit in this report, user from tokenmak lose fund as well
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> as the protocol docs mentioned
+> 
+> https://audits.sherlock.xyz/contests/101
+> 
+> > In case of external protocol integrations, are the risks of external contracts pausing or executing an emergency withdrawal acceptable? If not, Watsons will submit issues related to these situations that can harm your protocol's functionality.
+> 
+> > Pausing or emergency withdrawals are not acceptable for Tokemak.
+> 
+> in the issue got exploit in this report, user from tokenmak lose fund as well
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Trumpero**
+
+Hi @JeffCX, based on this comment of sponsors in the contest channel, I think this issue should be marked as low/invalid: 
+https://discord.com/channels/812037309376495636/1130514263522410506/1143588977962647582
+<img width="1102" alt="Screenshot 2023-10-07 at 15 01 02" src="https://github.com/sherlock-audit/2023-06-tokemak-judging/assets/114548871/317edd8a-36c8-430d-968a-865310a57c4c">
+
+
+**JeffCX**
+
+Sponsor said emergency withdrawal or pause is an unacceptable risk.
+
+Did you read it as "acceptable" sir?
+
+**JeffCX**
+
+Some discussion is happening https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/899
+
+but this is a separate external integration risk than the balancer one that can impact tokemak user :) and don't think this is a known issue
+
+**Trumpero**
+
+Hello @JeffCX,
+
+Upon further consideration of this matter, I find it to be valid. The potential for the curve admin to exploit the reentrancy-attack and drain the curve pool could have a direct impact on the Tokemak protocol. 
+
+I suggest that you review this issue as well, @codenutt.
+
+**JeffCX**
+
+> Hello @JeffCX,
+> 
+> Upon further consideration of this matter, I find it to be valid. The potential for the curve admin to exploit the reentrancy-attack and drain the curve pool could have a direct impact on the Tokemak protocol.
+> 
+> I suggest that you review this issue as well, @codenutt.
+
+Thank you very much! 😄🎉！！
+
+**codenutt**
+
+Thanks @Trumpero / @JeffCX! Just to confirm, this is an issue with some Curve pools just in general, correct? Not necessarily with a particular interaction we have with them.
+
+**Trumpero**
+
+Yes, you are right 
+
+**Evert0x**
+
+Planning to accept escalation and label issue as valid 
+
+**JeffCX**
+
+thanks👍🙏
+
+**Evert0x**
+
+@Trumpero would you agree with high severity?
+
+**Trumpero**
+
+No I think it should be medium since it assume the curve admin become malicious 
+
+**JeffCX**
+
+Agree with medium, https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/570 similar finding about external admin turn into malicious risk is marked as medium as well
+
+**Evert0x**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [JEFFCX](https://github.com/sherlock-audit/2023-06-tokemak-judging/issues/862/#issuecomment-1745265050): accepted
 
